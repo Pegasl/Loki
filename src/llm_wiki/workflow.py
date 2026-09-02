@@ -1,9 +1,10 @@
 import json
+from pathlib import Path
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from .wiki import wiki_init, wiki_register
+from .wiki import wiki_ingest, wiki_init, wiki_register
 
 
 class WikiState(TypedDict):
@@ -12,12 +13,17 @@ class WikiState(TypedDict):
     verify: bool
     retrieve: bool
 
-
-STATE_FILE = "wiki/wiki-state.json"
+root = Path(".").expanduser().resolve()
+raw = root / "raw"
+wiki = root / "wiki"
+log = wiki / "log.md"
+aliases = wiki / "aliases.json"
+sources = wiki / "sources.json"
+state_file = wiki / "state.json"
 
 
 def save_state(state: WikiState) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as file:
+    with open(state_file, "w", encoding="utf-8") as file:
         json.dump(state, file, ensure_ascii=False, indent=2)
 
 
@@ -26,12 +32,28 @@ def init(state: WikiState) -> dict[str, bool]:
 
 
 def ingest(state: WikiState) -> dict[str, bool]:
-    wiki_register()
-    # if 
-    #     return {"ingest": True}
-    # else:
-    #     return {"ingest": False}
-    return {"ingest": True}
+    if not wiki_register():
+        return {"ingest": False}
+
+    try:
+        registrations = json.loads(sources.read_text(encoding="utf-8"))
+        if not isinstance(registrations, list):
+            return {"ingest": False}
+
+        pending_srcids = []
+        for registration in registrations:
+            if not isinstance(registration, dict):
+                return {"ingest": False}
+            if registration.get("ingest") is False:
+                srcid = registration.get("srcid")
+                if not isinstance(srcid, str) or not srcid:
+                    return {"ingest": False}
+                pending_srcids.append(srcid)
+    except (OSError, json.JSONDecodeError):
+        return {"ingest": False}
+
+    results = [wiki_ingest(srcid) for srcid in pending_srcids]
+    return {"ingest": all(results)}
 
 
 def verify(state: WikiState) -> dict[str, bool]:
@@ -116,7 +138,7 @@ wiki_graph = builder.compile()
 
 def main() -> None:
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as file:
+        with open(state_file, "r", encoding="utf-8") as file:
             initial_state: WikiState = json.load(file)
     except FileNotFoundError:
         initial_state = {
@@ -125,7 +147,9 @@ def main() -> None:
             "verify": False,
             "retrieve": False,
         }
-        save_state(initial_state)
+        wiki.mkdir(exist_ok=True)
+        state_file.write_text(json.dumps(initial_state), encoding="utf-8")
+
     result = wiki_graph.invoke(initial_state)
     save_state(result)
 
