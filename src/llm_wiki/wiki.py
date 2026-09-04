@@ -12,6 +12,10 @@ def wiki_init(root: str | Path = ".") -> bool:
     raw = root / "raw"
     wiki = root / "wiki"
     log = wiki / "log.md"
+    workflow_log = wiki / "workflow-log"
+    ingest_log = workflow_log / "ingest-log.md"
+    verify_log = workflow_log / "verify-log.md"
+    retrive_log = workflow_log / "retrive-log.md"
     aliases = wiki / "aliases.json"
     sources = wiki / "sources.json"
 
@@ -23,6 +27,11 @@ def wiki_init(root: str | Path = ".") -> bool:
         return False
     if log.exists() and not log.is_file():
         return False
+    if workflow_log.exists() and not workflow_log.is_dir():
+        return False
+    for workflow_log_file in (ingest_log, verify_log, retrive_log):
+        if workflow_log_file.exists() and not workflow_log_file.is_file():
+            return False
     if aliases.exists() and not aliases.is_file():
         return False
     if sources.exists() and not sources.is_file():
@@ -32,9 +41,14 @@ def wiki_init(root: str | Path = ".") -> bool:
         root.mkdir(parents=True, exist_ok=True)
         raw.mkdir(exist_ok=True)
         wiki.mkdir(exist_ok=True)
+        workflow_log.mkdir(exist_ok=True)
 
         if not log.exists():
             log.write_text("", encoding="utf-8")
+
+        for workflow_log_file in (ingest_log, verify_log, retrive_log):
+            if not workflow_log_file.exists():
+                workflow_log_file.write_text("", encoding="utf-8")
 
         if not aliases.exists():
             aliases.write_text("", encoding="utf-8")
@@ -54,7 +68,7 @@ def wiki_register(root: str | Path = ".") -> bool:
     raw = root / "raw"
     wiki = root / "wiki"
     sources_file = wiki / "sources.json"
-    log_file = wiki / "log.md"
+    log_file = wiki / "workflow-log" / "ingest-log.md"
 
     errors = []
     log_messages = []
@@ -63,6 +77,7 @@ def wiki_register(root: str | Path = ".") -> bool:
         root.mkdir(parents=True, exist_ok=True)
         raw.mkdir(exist_ok=True)
         wiki.mkdir(exist_ok=True)
+        log_file.parent.mkdir(exist_ok=True)
 
         if sources_file.exists():
             text = sources_file.read_text(encoding="utf-8")
@@ -219,6 +234,7 @@ def wiki_register(root: str | Path = ".") -> bool:
     except Exception as error:
         try:
             wiki.mkdir(parents=True, exist_ok=True)
+            log_file.parent.mkdir(exist_ok=True)
             old_log = log_file.read_text(encoding="utf-8").rstrip() if log_file.exists() else ""
             message = (
                 f"## [{datetime.now().astimezone().date().isoformat()}] "
@@ -238,7 +254,7 @@ def wiki_ingest(srcid: str) -> bool:
     raw = root / "raw"
     sources_file = wiki / "sources.json"
     aliases_file = wiki / "aliases.json"
-    log_file = wiki / "log.md"
+    log_file = wiki / "workflow-log" / "ingest-log.md"
 
     filename = ""
     document = wiki
