@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import TypedDict
+from typing import Callable, Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
@@ -13,6 +13,109 @@ class WikiState(TypedDict):
     verify: bool
     retrieve: bool
 
+
+class ProgressReporter(Protocol):
+    def workflow_started(self) -> None: ...
+
+    def workflow_completed(self) -> None: ...
+
+    def stage_started(self, stage: str, attempt: int) -> None: ...
+
+    def stage_succeeded(self, stage: str) -> None: ...
+
+    def stage_failed(self, stage: str, error: BaseException | None = None) -> None: ...
+
+    def stage_retrying(self, stage: str, next_attempt: int) -> None: ...
+
+    def no_pending_sources(self) -> None: ...
+
+    def source_started(self, index: int, total: int, srcid: str) -> None: ...
+
+    def source_succeeded(self, index: int, total: int, srcid: str) -> None: ...
+
+    def source_failed(self, index: int, total: int, srcid: str) -> None: ...
+
+
+class NullProgressReporter:
+    def workflow_started(self) -> None:
+        pass
+
+    def workflow_completed(self) -> None:
+        pass
+
+    def stage_started(self, stage: str, attempt: int) -> None:
+        pass
+
+    def stage_succeeded(self, stage: str) -> None:
+        pass
+
+    def stage_failed(self, stage: str, error: BaseException | None = None) -> None:
+        pass
+
+    def stage_retrying(self, stage: str, next_attempt: int) -> None:
+        pass
+
+    def no_pending_sources(self) -> None:
+        pass
+
+    def source_started(self, index: int, total: int, srcid: str) -> None:
+        pass
+
+    def source_succeeded(self, index: int, total: int, srcid: str) -> None:
+        pass
+
+    def source_failed(self, index: int, total: int, srcid: str) -> None:
+        pass
+
+
+class TerminalProgressReporter(NullProgressReporter):
+    @staticmethod
+    def _display(value: object) -> str:
+        return " ".join(str(value).splitlines())
+
+    @staticmethod
+    def _write(message: str) -> None:
+        print(message, flush=True)
+
+    def workflow_started(self) -> None:
+        self._write("[workflow] START")
+
+    def workflow_completed(self) -> None:
+        self._write("[workflow] COMPLETE")
+
+    def stage_started(self, stage: str, attempt: int) -> None:
+        self._write(f"[{self._display(stage)}] START attempt={attempt}")
+
+    def stage_succeeded(self, stage: str) -> None:
+        self._write(f"[{self._display(stage)}] OK")
+
+    def stage_failed(self, stage: str, error: BaseException | None = None) -> None:
+        message = f"[{self._display(stage)}] FAILED"
+        if error is not None:
+            message += f" error={self._display(error)}"
+        self._write(message)
+
+    def stage_retrying(self, stage: str, next_attempt: int) -> None:
+        self._write(f"[{self._display(stage)}] RETRY attempt={next_attempt}")
+
+    def no_pending_sources(self) -> None:
+        self._write("[ingest] NO PENDING SOURCES")
+
+    def source_started(self, index: int, total: int, srcid: str) -> None:
+        self._source_status(index, total, srcid, "START")
+
+    def source_succeeded(self, index: int, total: int, srcid: str) -> None:
+        self._source_status(index, total, srcid, "OK")
+
+    def source_failed(self, index: int, total: int, srcid: str) -> None:
+        self._source_status(index, total, srcid, "FAILED")
+
+    def _source_status(self, index: int, total: int, srcid: str, status: str) -> None:
+        self._write(
+            f"[ingest] SOURCE {index}/{total} {status} srcid={self._display(srcid)}"
+        )
+
+
 root = Path(".").expanduser().resolve()
 raw = root / "raw"
 wiki = root / "wiki"
@@ -20,6 +123,13 @@ log = wiki / "log.md"
 aliases = wiki / "aliases.json"
 sources = wiki / "sources.json"
 state_file = wiki / "state.json"
+
+
+def _report(callback: Callable[..., None], *args: object) -> None:
+    try:
+        callback(*args)
+    except Exception:
+        pass
 
 
 def save_state(state: WikiState) -> None:
@@ -31,7 +141,10 @@ def init(state: WikiState) -> dict[str, bool]:
     return {"init": wiki_init()}
 
 
-def ingest(state: WikiState) -> dict[str, bool]:
+def ingest(
+    state: WikiState, reporter: ProgressReporter | None = None
+) -> dict[str, bool]:
+    progress = reporter or NullProgressReporter()
     if not wiki_register():
         return {"ingest": False}
 
@@ -52,12 +165,29 @@ def ingest(state: WikiState) -> dict[str, bool]:
     except (OSError, json.JSONDecodeError):
         return {"ingest": False}
 
-    results = [wiki_ingest(srcid) for srcid in pending_srcids]
+    if not pending_srcids:
+        _report(progress.no_pending_sources)
+
+    results = []
+    total = len(pending_srcids)
+    for index, srcid in enumerate(pending_srcids, start=1):
+        _report(progress.source_started, index, total, srcid)
+        try:
+            result = wiki_ingest(srcid)
+        except Exception:
+            _report(progress.source_failed, index, total, srcid)
+            raise
+        if result:
+            _report(progress.source_succeeded, index, total, srcid)
+        else:
+            _report(progress.source_failed, index, total, srcid)
+        results.append(result)
+
     return {"ingest": all(results)}
 
 
 def verify(state: WikiState) -> dict[str, bool]:
-    # if 
+    # if
     #     return {"verify": True}
     # else:
     #     return {"verify": False}
@@ -65,7 +195,7 @@ def verify(state: WikiState) -> dict[str, bool]:
 
 
 def retrieve(state: WikiState) -> dict[str, bool]:
-    # if 
+    # if
     #     return {"retrieve": True}
     # else:
     #     return {"retrieve": False}
@@ -107,33 +237,70 @@ def next_retrieve(state: WikiState) -> str:
     return "retry"
 
 
-builder = StateGraph(WikiState)
+def build_graph(reporter: ProgressReporter | None = None):
+    progress = reporter or NullProgressReporter()
+    attempts = {"init": 0, "ingest": 0, "verify": 0, "retrieve": 0}
 
-builder.add_node("init", init)
-builder.add_node("ingest", ingest)
-builder.add_node("verify", verify)
-builder.add_node("retrieve", retrieve)
+    def wrap_stage(stage: str, function: Callable[[WikiState], dict[str, bool]]):
+        def run(state: WikiState) -> dict[str, bool]:
+            attempts[stage] += 1
+            _report(progress.stage_started, stage, attempts[stage])
+            try:
+                result = function(state)
+            except Exception as error:
+                _report(progress.stage_failed, stage, error)
+                raise
+            if result.get(stage) is True:
+                _report(progress.stage_succeeded, stage)
+            else:
+                _report(progress.stage_failed, stage)
+            return result
 
-builder.add_edge(START, "init")
+        return run
 
-builder.add_conditional_edges(
-    "init",
-    next_init,
-    {"next": "ingest", "retry": "init"},
-)
-builder.add_conditional_edges(
-    "ingest",
-    next_ingest,
-    {"next": "verify", "retry": "ingest"},
-)
-builder.add_conditional_edges(
-    "verify",
-    next_verify,
-    {"next": "retrieve", "retry": "verify"},
-)
-builder.add_edge("retrieve", END)
+    def run_ingest(state: WikiState) -> dict[str, bool]:
+        return ingest(state, progress)
 
-wiki_graph = builder.compile()
+    def route(stage: str, function: Callable[[WikiState], str]):
+        def choose(state: WikiState) -> str:
+            destination = function(state)
+            if destination == "retry":
+                _report(progress.stage_retrying, stage, attempts[stage] + 1)
+            return destination
+
+        return choose
+
+    builder = StateGraph(WikiState)
+    builder.add_node("init", wrap_stage("init", init))
+    builder.add_node("ingest", wrap_stage("ingest", run_ingest))
+    builder.add_node("verify", wrap_stage("verify", verify))
+    builder.add_node("retrieve", wrap_stage("retrieve", retrieve))
+
+    builder.add_edge(START, "init")
+    builder.add_conditional_edges(
+        "init",
+        route("init", next_init),
+        {"next": "ingest", "retry": "init"},
+    )
+    builder.add_conditional_edges(
+        "ingest",
+        route("ingest", next_ingest),
+        {"next": "verify", "retry": "ingest"},
+    )
+    builder.add_conditional_edges(
+        "verify",
+        route("verify", next_verify),
+        {"next": "retrieve", "retry": "verify"},
+    )
+    builder.add_conditional_edges(
+        "retrieve",
+        route("retrieve", next_retrieve),
+        {"next": END, "retry": "retrieve"},
+    )
+    return builder.compile()
+
+
+wiki_graph = build_graph()
 
 
 def main() -> None:
@@ -150,8 +317,12 @@ def main() -> None:
         wiki.mkdir(exist_ok=True)
         state_file.write_text(json.dumps(initial_state), encoding="utf-8")
 
-    result = wiki_graph.invoke(initial_state)
+    reporter = TerminalProgressReporter()
+    _report(reporter.workflow_started)
+    result = build_graph(reporter).invoke(initial_state)
     save_state(result)
+    _report(reporter.workflow_completed)
+
 
 if __name__ == "__main__":
     main()
