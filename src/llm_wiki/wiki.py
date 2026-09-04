@@ -5,6 +5,8 @@ import secrets
 from datetime import datetime
 from pathlib import Path
 
+from .progress import NullProgressReporter, ProgressReporter, report_event
+
 
 def wiki_init(root: str | Path = ".") -> bool:
     """Create the small directory structure needed by the Wiki."""
@@ -247,8 +249,9 @@ def wiki_register(root: str | Path = ".") -> bool:
             pass
         return False
 
-def wiki_ingest(srcid: str) -> bool:
+def wiki_ingest(srcid: str, reporter: ProgressReporter | None = None) -> bool:
     """Use a small LangGraph agent to ingest one registered source."""
+    progress = reporter or NullProgressReporter()
     root = Path.cwd().resolve()
     wiki = root / "wiki"
     raw = root / "raw"
@@ -458,20 +461,39 @@ claims from other sources. When all writes are finished, return a concise report
             message = state["messages"][-1]
             results = []
             for call in message.tool_calls:
-                selected_tool = available_tools.get(call["name"])
+                tool_name = str(call.get("name", "unknown"))
+                call_id = str(call.get("id", "unknown"))
+                report_event(progress, "tool_started", tool_name, call_id)
+                selected_tool = available_tools.get(tool_name)
                 if selected_tool is None:
-                    raise ValueError(f"Unknown tool: {call['name']}")
-                output = selected_tool.invoke(call["args"])
-                results.append(
-                    ToolMessage(content=str(output), tool_call_id=call["id"])
-                )
+                    error = ValueError(f"Unknown tool: {tool_name}")
+                    report_event(progress, "tool_failed", tool_name, call_id, error)
+                    raise error
+                try:
+                    output = selected_tool.invoke(call["args"])
+                except Exception as error:
+                    report_event(progress, "tool_failed", tool_name, call_id, error)
+                    raise
+                report_event(progress, "tool_succeeded", tool_name, call_id)
+                results.append(ToolMessage(content=str(output), tool_call_id=call_id))
             return {"messages": results}
 
-        def alias_agent(state: MessagesState) -> dict:
-            response = alias_model.invoke(
-                [SystemMessage(content=alias_prompt), *state["messages"]]
-            )
+        def run_agent(agent: str, model, messages: list) -> dict:
+            report_event(progress, "agent_started", agent)
+            try:
+                response = model.invoke(messages)
+            except Exception as error:
+                report_event(progress, "agent_failed", agent, error)
+                raise
+            report_event(progress, "agent_succeeded", agent)
             return {"messages": [response]}
+
+        def alias_agent(state: MessagesState) -> dict:
+            return run_agent(
+                "alias",
+                alias_model,
+                [SystemMessage(content=alias_prompt), *state["messages"]],
+            )
 
         def alias_tool_node(state: MessagesState) -> dict:
             return run_tool_calls(state, alias_tool_map)
@@ -481,19 +503,27 @@ claims from other sources. When all writes are finished, return a concise report
             return "tools" if message.tool_calls else "content"
 
         def prepare_content(_: MessagesState) -> dict:
-            return {
-                "messages": [
-                    HumanMessage(
-                        content="Alias handling is complete. Now generate this source's Wiki pages."
-                    )
-                ]
-            }
+            report_event(progress, "node_started", "prepare_content")
+            try:
+                result = {
+                    "messages": [
+                        HumanMessage(
+                            content="Alias handling is complete. Now generate this source's Wiki pages."
+                        )
+                    ]
+                }
+            except Exception as error:
+                report_event(progress, "node_failed", "prepare_content", error)
+                raise
+            report_event(progress, "node_succeeded", "prepare_content")
+            return result
 
         def content_agent(state: MessagesState) -> dict:
-            response = content_model.invoke(
-                [SystemMessage(content=content_prompt), *state["messages"]]
+            return run_agent(
+                "content",
+                content_model,
+                [SystemMessage(content=content_prompt), *state["messages"]],
             )
-            return {"messages": [response]}
 
         def content_tool_node(state: MessagesState) -> dict:
             return run_tool_calls(state, content_tool_map)

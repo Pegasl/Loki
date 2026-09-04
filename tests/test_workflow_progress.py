@@ -43,7 +43,10 @@ class WorkflowProgressTests(unittest.TestCase):
             result = workflow.ingest(STATE, reporter)
 
         self.assertEqual(result, {"ingest": False})
-        self.assertEqual(ingest.call_args_list, [call("first"), call("second")])
+        self.assertEqual(
+            ingest.call_args_list,
+            [call("first", reporter=reporter), call("second", reporter=reporter)],
+        )
         reporter.source_started.assert_has_calls(
             [call(1, 2, "first"), call(2, 2, "second")]
         )

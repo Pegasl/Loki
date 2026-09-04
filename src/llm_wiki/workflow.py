@@ -1,9 +1,15 @@
 import json
 from pathlib import Path
-from typing import Callable, Protocol, TypedDict
+from typing import Callable, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from .progress import (
+    NullProgressReporter,
+    ProgressReporter,
+    TerminalProgressReporter,
+    report,
+)
 from .wiki import wiki_ingest, wiki_init, wiki_register
 
 
@@ -14,108 +20,6 @@ class WikiState(TypedDict):
     retrieve: bool
 
 
-class ProgressReporter(Protocol):
-    def workflow_started(self) -> None: ...
-
-    def workflow_completed(self) -> None: ...
-
-    def stage_started(self, stage: str, attempt: int) -> None: ...
-
-    def stage_succeeded(self, stage: str) -> None: ...
-
-    def stage_failed(self, stage: str, error: BaseException | None = None) -> None: ...
-
-    def stage_retrying(self, stage: str, next_attempt: int) -> None: ...
-
-    def no_pending_sources(self) -> None: ...
-
-    def source_started(self, index: int, total: int, srcid: str) -> None: ...
-
-    def source_succeeded(self, index: int, total: int, srcid: str) -> None: ...
-
-    def source_failed(self, index: int, total: int, srcid: str) -> None: ...
-
-
-class NullProgressReporter:
-    def workflow_started(self) -> None:
-        pass
-
-    def workflow_completed(self) -> None:
-        pass
-
-    def stage_started(self, stage: str, attempt: int) -> None:
-        pass
-
-    def stage_succeeded(self, stage: str) -> None:
-        pass
-
-    def stage_failed(self, stage: str, error: BaseException | None = None) -> None:
-        pass
-
-    def stage_retrying(self, stage: str, next_attempt: int) -> None:
-        pass
-
-    def no_pending_sources(self) -> None:
-        pass
-
-    def source_started(self, index: int, total: int, srcid: str) -> None:
-        pass
-
-    def source_succeeded(self, index: int, total: int, srcid: str) -> None:
-        pass
-
-    def source_failed(self, index: int, total: int, srcid: str) -> None:
-        pass
-
-
-class TerminalProgressReporter(NullProgressReporter):
-    @staticmethod
-    def _display(value: object) -> str:
-        return " ".join(str(value).splitlines())
-
-    @staticmethod
-    def _write(message: str) -> None:
-        print(message, flush=True)
-
-    def workflow_started(self) -> None:
-        self._write("[workflow] START")
-
-    def workflow_completed(self) -> None:
-        self._write("[workflow] COMPLETE")
-
-    def stage_started(self, stage: str, attempt: int) -> None:
-        self._write(f"[{self._display(stage)}] START attempt={attempt}")
-
-    def stage_succeeded(self, stage: str) -> None:
-        self._write(f"[{self._display(stage)}] OK")
-
-    def stage_failed(self, stage: str, error: BaseException | None = None) -> None:
-        message = f"[{self._display(stage)}] FAILED"
-        if error is not None:
-            message += f" error={self._display(error)}"
-        self._write(message)
-
-    def stage_retrying(self, stage: str, next_attempt: int) -> None:
-        self._write(f"[{self._display(stage)}] RETRY attempt={next_attempt}")
-
-    def no_pending_sources(self) -> None:
-        self._write("[ingest] NO PENDING SOURCES")
-
-    def source_started(self, index: int, total: int, srcid: str) -> None:
-        self._source_status(index, total, srcid, "START")
-
-    def source_succeeded(self, index: int, total: int, srcid: str) -> None:
-        self._source_status(index, total, srcid, "OK")
-
-    def source_failed(self, index: int, total: int, srcid: str) -> None:
-        self._source_status(index, total, srcid, "FAILED")
-
-    def _source_status(self, index: int, total: int, srcid: str, status: str) -> None:
-        self._write(
-            f"[ingest] SOURCE {index}/{total} {status} srcid={self._display(srcid)}"
-        )
-
-
 root = Path(".").expanduser().resolve()
 raw = root / "raw"
 wiki = root / "wiki"
@@ -123,13 +27,6 @@ log = wiki / "log.md"
 aliases = wiki / "aliases.json"
 sources = wiki / "sources.json"
 state_file = wiki / "state.json"
-
-
-def _report(callback: Callable[..., None], *args: object) -> None:
-    try:
-        callback(*args)
-    except Exception:
-        pass
 
 
 def save_state(state: WikiState) -> None:
@@ -166,21 +63,21 @@ def ingest(
         return {"ingest": False}
 
     if not pending_srcids:
-        _report(progress.no_pending_sources)
+        report(progress.no_pending_sources)
 
     results = []
     total = len(pending_srcids)
     for index, srcid in enumerate(pending_srcids, start=1):
-        _report(progress.source_started, index, total, srcid)
+        report(progress.source_started, index, total, srcid)
         try:
-            result = wiki_ingest(srcid)
+            result = wiki_ingest(srcid, reporter=progress)
         except Exception:
-            _report(progress.source_failed, index, total, srcid)
+            report(progress.source_failed, index, total, srcid)
             raise
         if result:
-            _report(progress.source_succeeded, index, total, srcid)
+            report(progress.source_succeeded, index, total, srcid)
         else:
-            _report(progress.source_failed, index, total, srcid)
+            report(progress.source_failed, index, total, srcid)
         results.append(result)
 
     return {"ingest": all(results)}
@@ -244,16 +141,16 @@ def build_graph(reporter: ProgressReporter | None = None):
     def wrap_stage(stage: str, function: Callable[[WikiState], dict[str, bool]]):
         def run(state: WikiState) -> dict[str, bool]:
             attempts[stage] += 1
-            _report(progress.stage_started, stage, attempts[stage])
+            report(progress.stage_started, stage, attempts[stage])
             try:
                 result = function(state)
             except Exception as error:
-                _report(progress.stage_failed, stage, error)
+                report(progress.stage_failed, stage, error)
                 raise
             if result.get(stage) is True:
-                _report(progress.stage_succeeded, stage)
+                report(progress.stage_succeeded, stage)
             else:
-                _report(progress.stage_failed, stage)
+                report(progress.stage_failed, stage)
             return result
 
         return run
@@ -265,7 +162,7 @@ def build_graph(reporter: ProgressReporter | None = None):
         def choose(state: WikiState) -> str:
             destination = function(state)
             if destination == "retry":
-                _report(progress.stage_retrying, stage, attempts[stage] + 1)
+                report(progress.stage_retrying, stage, attempts[stage] + 1)
             return destination
 
         return choose
@@ -318,10 +215,10 @@ def main() -> None:
         state_file.write_text(json.dumps(initial_state), encoding="utf-8")
 
     reporter = TerminalProgressReporter()
-    _report(reporter.workflow_started)
+    report(reporter.workflow_started)
     result = build_graph(reporter).invoke(initial_state)
     save_state(result)
-    _report(reporter.workflow_completed)
+    report(reporter.workflow_completed)
 
 
 if __name__ == "__main__":
