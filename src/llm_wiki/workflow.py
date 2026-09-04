@@ -10,7 +10,7 @@ from .progress import (
     TerminalProgressReporter,
     report,
 )
-from .wiki import wiki_ingest, wiki_init, wiki_register
+from .wiki import wiki_ingest, wiki_init, wiki_register, wiki_verify
 
 
 class WikiState(TypedDict):
@@ -84,11 +84,7 @@ def ingest(
 
 
 def verify(state: WikiState) -> dict[str, bool]:
-    # if
-    #     return {"verify": True}
-    # else:
-    #     return {"verify": False}
-    return {"verify": True}
+    return {"verify": wiki_verify()}
 
 
 def retrieve(state: WikiState) -> dict[str, bool]:

@@ -128,6 +128,13 @@ class WorkflowProgressTests(unittest.TestCase):
         self.assertEqual(result, {"ingest": True})
         reporter.source_succeeded.assert_called_once_with(1, 1, "source")
 
+    def test_verify_returns_wiki_verify_result(self) -> None:
+        with patch.object(workflow, "wiki_verify", return_value=False) as verify:
+            result = workflow.verify(STATE)
+
+        self.assertEqual(result, {"verify": False})
+        verify.assert_called_once_with()
+
     def test_graph_reports_stage_lifecycle(self) -> None:
         reporter = Mock(spec=workflow.ProgressReporter)
         state_path = Path(self.temp_dir.name) / "state.json"
@@ -137,6 +144,7 @@ class WorkflowProgressTests(unittest.TestCase):
             patch.object(workflow, "state_file", state_path),
             patch.object(workflow, "wiki_init", return_value=True),
             patch.object(workflow, "wiki_register", return_value=True),
+            patch.object(workflow, "wiki_verify", return_value=True),
         ):
             result = workflow.build_graph(reporter).invoke(STATE)
 
@@ -169,6 +177,7 @@ class WorkflowProgressTests(unittest.TestCase):
             patch.object(workflow, "state_file", state_path),
             patch.object(workflow, "wiki_init", side_effect=[False, True]),
             patch.object(workflow, "wiki_register", return_value=True),
+            patch.object(workflow, "wiki_verify", return_value=True),
         ):
             workflow.build_graph(reporter).invoke(STATE)
 
@@ -188,6 +197,7 @@ class WorkflowProgressTests(unittest.TestCase):
             patch.object(workflow, "state_file", state_path),
             patch.object(workflow, "wiki_init", return_value=True),
             patch.object(workflow, "wiki_register", return_value=True),
+            patch.object(workflow, "wiki_verify", return_value=True),
             patch.object(workflow, "retrieve", side_effect=[{"retrieve": False}, {"retrieve": True}]),
         ):
             result = workflow.build_graph(reporter).invoke(STATE)

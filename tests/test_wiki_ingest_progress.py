@@ -199,6 +199,19 @@ class WikiIngestProgressTests(unittest.TestCase):
             ],
         )
 
+    def test_uses_collision_fallback_document(self) -> None:
+        document = self.root / "wiki" / "source"
+        fallback = self.root / "wiki" / "source-srcid-test"
+        document.rename(fallback)
+        document.mkdir()
+
+        with patch("langchain_openai.ChatOpenAI", FakeChatModel):
+            result = wiki_ingest("srcid-test")
+
+        self.assertTrue(result)
+        self.assertTrue((fallback / "concepts" / "topic.md").is_file())
+        self.assertFalse((document / "concepts" / "topic.md").exists())
+
     def test_agent_failure_is_reported_and_preserves_bool_api(self) -> None:
         reporter = RecordingReporter()
 

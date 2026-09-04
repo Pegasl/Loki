@@ -249,6 +249,218 @@ def wiki_register(root: str | Path = ".") -> bool:
             pass
         return False
 
+
+def _parse_frontmatter(text: str) -> tuple[dict[str, object], str]:
+    """Return simple scalar frontmatter and the Markdown body."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise ValueError("missing frontmatter")
+    try:
+        end = next(i for i, line in enumerate(lines[1:], 1) if line.strip() == "---")
+    except StopIteration as error:
+        raise ValueError("frontmatter is not closed") from error
+
+    frontmatter: dict[str, object] = {}
+    for line in lines[1:end]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line[:1].isspace() or ":" not in line:
+            raise ValueError(f"unsupported frontmatter line: {line.strip()}")
+        key, raw_value = line.split(":", 1)
+        key = key.strip()
+        if not key or key in frontmatter:
+            raise ValueError(f"invalid or duplicate frontmatter key: {key}")
+        value = raw_value.strip()
+        if value.startswith('"'):
+            try:
+                frontmatter[key] = json.loads(value)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"invalid quoted value for {key}") from error
+        elif value.startswith("'"):
+            if len(value) < 2 or not value.endswith("'"):
+                raise ValueError(f"invalid quoted value for {key}")
+            frontmatter[key] = value[1:-1].replace("''", "'")
+        else:
+            frontmatter[key] = value
+    return frontmatter, "\n".join(lines[end + 1 :]).strip()
+
+
+def _wiki_document(
+    wiki: Path, filename: str, srcid: str
+) -> tuple[Path | None, Path, str | None]:
+    """Locate a registered document using wiki_register's naming rules."""
+    document_name = Path(filename).stem.strip() or "source"
+    summary_name = f"source-summary-{srcid.removeprefix('srcid-')}.md"
+    candidates = list(dict.fromkeys([
+        wiki / document_name,
+        wiki / f"{document_name}-{srcid}",
+    ]))
+    directories = [path for path in candidates if path.is_dir()]
+    matches = [path for path in directories if (path / summary_name).is_file()]
+    if len(matches) == 1:
+        document = matches[0]
+        return document, document / summary_name, None
+    if len(matches) > 1:
+        return None, wiki / summary_name, "multiple Wiki directories match the registration"
+    fallback = wiki / f"{document_name}-{srcid}"
+    if fallback in directories:
+        return fallback, fallback / summary_name, None
+    if len(directories) == 1:
+        document = directories[0]
+        return document, document / summary_name, None
+    if len(directories) > 1:
+        return None, wiki / summary_name, "Wiki directory is ambiguous"
+    return None, wiki / summary_name, "registered Wiki directory does not exist"
+
+
+def wiki_verify(root: str | Path = ".") -> bool:
+    """Verify every registered raw source without stopping after failures."""
+    root = Path(root).expanduser().resolve()
+    raw = root / "raw"
+    wiki = root / "wiki"
+    sources_file = wiki / "sources.json"
+    log_file = wiki / "workflow-log" / "verify-log.md"
+    events: list[str] = []
+    all_valid = True
+
+    def clean(value: object) -> str:
+        return " ".join(str(value).replace("`", "'").split())
+
+    def add_event(filename: object, srcid: object, errors: list[str] | None = None) -> None:
+        lines = [
+            f"## [{datetime.now().astimezone().date().isoformat()}] verify | {clean(filename)}",
+            "",
+            f"- SrcID: `{clean(srcid)}`",
+            f"- Status: `{'failed' if errors else 'passed'}`",
+        ]
+        lines.extend(f"- Error: {clean(error)}" for error in errors or [])
+        events.append("\n".join(lines))
+
+    try:
+        registrations = json.loads(sources_file.read_text(encoding="utf-8"))
+        if not isinstance(registrations, list):
+            raise ValueError("wiki/sources.json must contain a JSON list")
+    except Exception as error:
+        add_event("sources.json", "unknown", [str(error)])
+        registrations = []
+        all_valid = False
+
+    valid_registrations: list[dict[str, str]] = []
+    registered_filenames: set[str] = set()
+    for index, registration in enumerate(registrations):
+        errors = []
+        if not isinstance(registration, dict):
+            add_event(f"sources.json entry {index}", "unknown", ["source registration must be an object"])
+            all_valid = False
+            continue
+        filename = registration.get("filename")
+        srcid = registration.get("srcid")
+        digest = registration.get("sha256")
+        if not isinstance(filename, str) or not filename.strip():
+            errors.append("registration filename must be a non-empty string")
+        if not isinstance(srcid, str) or not srcid.strip():
+            errors.append("registration srcid must be a non-empty string")
+        if not isinstance(digest, str) or len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            errors.append("registration sha256 must be 64 lowercase hexadecimal characters")
+        if errors:
+            add_event(filename or f"sources.json entry {index}", srcid or "unknown", errors)
+            all_valid = False
+            continue
+        valid_registrations.append({"filename": filename, "srcid": srcid, "sha256": digest})
+        registered_filenames.add(filename)
+
+    raw_files = sorted(
+        path for path in raw.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".md", ".txt"}
+    ) if raw.is_dir() else []
+    for path in raw_files:
+        filename = path.relative_to(raw).as_posix()
+        if filename not in registered_filenames:
+            add_event(filename, "unregistered", ["raw file is not registered in sources.json"])
+            all_valid = False
+
+    for registration in valid_registrations:
+        filename = registration["filename"]
+        srcid = registration["srcid"]
+        digest = registration["sha256"]
+        errors: list[str] = []
+        source_file = (raw / filename).resolve()
+        if not source_file.is_relative_to(raw.resolve()):
+            errors.append("registered source path escapes raw directory")
+        elif not source_file.is_file():
+            errors.append("registered source file does not exist")
+        else:
+            try:
+                actual_digest = hashlib.sha256(source_file.read_bytes()).hexdigest()
+                if actual_digest != digest:
+                    errors.append(f"raw SHA256 does not match registration (expected {digest}, found {actual_digest})")
+            except OSError as error:
+                errors.append(f"unable to read registered source: {error}")
+
+        document, summary, document_error = _wiki_document(wiki, filename, srcid)
+        if document_error:
+            errors.append(document_error)
+        if document is not None:
+            markdown_files = sorted(document.rglob("*.md"))
+            parsed_files: dict[Path, tuple[dict[str, object], str]] = {}
+            if not summary.is_file():
+                errors.append(f"missing Source Summary: {summary.name}")
+            if any(path != summary for path in document.glob("source-summary-*.md")):
+                errors.append("document contains an unexpected additional Source Summary")
+
+            for markdown_file in markdown_files:
+                relative = markdown_file.relative_to(document).as_posix()
+                try:
+                    parsed = _parse_frontmatter(markdown_file.read_text(encoding="utf-8"))
+                    parsed_files[markdown_file] = parsed
+                    frontmatter, body = parsed
+                    for field in ("type", "description"):
+                        value = frontmatter.get(field)
+                        if not isinstance(value, str) or not value.strip():
+                            errors.append(f"{relative}: {field} is empty")
+                    if not body:
+                        errors.append(f"{relative}: body is empty")
+                except (OSError, UnicodeError, ValueError) as error:
+                    errors.append(f"{relative}: {error}")
+
+            if summary in parsed_files:
+                frontmatter, _ = parsed_files[summary]
+                expected = {
+                    "type": "Source Summary",
+                    "srcid": srcid,
+                    "source_hash": f"sha256:{digest}",
+                    "source": os.path.relpath(raw / filename, summary.parent).replace(os.sep, "/"),
+                }
+                for field, expected_value in expected.items():
+                    if frontmatter.get(field) != expected_value:
+                        errors.append(f"{summary.name}: {field} does not match registration (expected {expected_value})")
+
+            if not any(
+                path.is_relative_to(document / "concepts") and frontmatter.get("type") == "Concept"
+                for path, (frontmatter, _) in parsed_files.items()
+            ):
+                errors.append("document has no Concept page below concepts/")
+            if not any(
+                path.is_relative_to(document / "entities") and frontmatter.get("type") == "Entity"
+                for path, (frontmatter, _) in parsed_files.items()
+            ):
+                errors.append("document has no Entity page below entities/")
+
+        add_event(filename, srcid, errors)
+        all_valid = all_valid and not errors
+
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        old_log = log_file.read_text(encoding="utf-8").rstrip() if log_file.exists() else ""
+        content = "\n\n".join(part for part in [old_log, *events] if part)
+        log_file.write_text(content + ("\n" if content else ""), encoding="utf-8")
+    except OSError:
+        return False
+    return all_valid
+
+
 def wiki_ingest(srcid: str, reporter: ProgressReporter | None = None) -> bool:
     """Use a small LangGraph agent to ingest one registered source."""
     progress = reporter or NullProgressReporter()
@@ -328,12 +540,10 @@ def wiki_ingest(srcid: str, reporter: ProgressReporter | None = None) -> bool:
         if not source_file.is_relative_to(raw.resolve()) or not source_file.is_file():
             raise ValueError(f"Registered source does not exist under raw/: {filename}")
 
-        document = (wiki / Path(filename).stem).resolve()
-        if not document.is_relative_to(wiki.resolve()) or not document.is_dir():
-            raise ValueError(f"Registered Wiki directory does not exist: {document}")
-
-        token = srcid.removeprefix("srcid-")
-        summary = document / f"source-summary-{token}.md"
+        document, summary, document_error = _wiki_document(wiki, filename, srcid)
+        if document_error or document is None:
+            raise ValueError(document_error or "Registered Wiki directory does not exist")
+        document = document.resolve()
         source_text = source_file.read_text(encoding="utf-8")
 
         document_root = document.resolve()
@@ -450,9 +660,10 @@ them. Every knowledge page must start with YAML frontmatter containing a non-emp
 single-line type and description. Do not create or edit index.md.
 
 If the source provides no reliable Concept, create concepts/placeholder.md with valid
-Concept frontmatter and an empty body. If it provides no reliable Entity, create
-entities/placeholder.md with valid Entity frontmatter and an empty body. State in each
-placeholder description that no reliable item was identified; do not invent content.
+Concept frontmatter and a short body stating that no reliable Concept was identified.
+If it provides no reliable Entity, create entities/placeholder.md with valid Entity
+frontmatter and a short body stating that no reliable Entity was identified. Do not
+invent content.
 
 Prefer updating an existing local page over creating a near duplicate. Do not write
 claims from other sources. When all writes are finished, return a concise report."""
