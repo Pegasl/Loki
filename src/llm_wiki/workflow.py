@@ -3,6 +3,8 @@ from pathlib import Path
 from typing import Callable, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.runtime import Runtime
+from langgraph.types import RetryPolicy
 
 from .progress import (
     NullProgressReporter,
@@ -11,6 +13,10 @@ from .progress import (
     report,
 )
 from .wiki import wiki_ingest, wiki_init, wiki_register, wiki_verify
+
+
+class NodeFailedError(RuntimeError):
+    """A workflow node returned an unsuccessful result."""
 
 
 class WikiState(TypedDict):
@@ -102,51 +108,28 @@ def retrieve(state: WikiState) -> dict[str, bool]:
 #     return new_state
 
 
-def next_init(state: WikiState) -> str:
-    if state["init"]:
-        save_state(state)
-        return "next"
-    return "retry"
-
-
-def next_ingest(state: WikiState) -> str:
-    if state["ingest"]:
-        save_state(state)
-        return "next"
-    return "retry"
-
-
-def next_verify(state: WikiState) -> str:
-    if state["verify"]:
-        save_state(state)
-        return "next"
-    return "retry"
-
-
-def next_retrieve(state: WikiState) -> str:
-    if state["retrieve"]:
-        save_state(state)
-        return "next"
-    return "retry"
-
-
 def build_graph(reporter: ProgressReporter | None = None):
     progress = reporter or NullProgressReporter()
-    attempts = {"init": 0, "ingest": 0, "verify": 0, "retrieve": 0}
+    retry_policy = RetryPolicy(max_attempts=6, retry_on=NodeFailedError)
 
     def wrap_stage(stage: str, function: Callable[[WikiState], dict[str, bool]]):
-        def run(state: WikiState) -> dict[str, bool]:
-            attempts[stage] += 1
-            report(progress.stage_started, stage, attempts[stage])
+        def run(state: WikiState, runtime: Runtime) -> dict[str, bool]:
+            if state.get(stage) is True:
+                return {}
+            attempt = runtime.execution_info.node_attempt
+            if attempt > 1:
+                report(progress.stage_retrying, stage, attempt)
+            report(progress.stage_started, stage, attempt)
             try:
                 result = function(state)
             except Exception as error:
                 report(progress.stage_failed, stage, error)
                 raise
-            if result.get(stage) is True:
-                report(progress.stage_succeeded, stage)
-            else:
+            if result.get(stage) is not True:
                 report(progress.stage_failed, stage)
+                raise NodeFailedError(f"Node {stage!r} returned an unsuccessful result")
+            report(progress.stage_succeeded, stage)
+            save_state({**state, **result})
             return result
 
         return run
@@ -154,42 +137,17 @@ def build_graph(reporter: ProgressReporter | None = None):
     def run_ingest(state: WikiState) -> dict[str, bool]:
         return ingest(state, progress)
 
-    def route(stage: str, function: Callable[[WikiState], str]):
-        def choose(state: WikiState) -> str:
-            destination = function(state)
-            if destination == "retry":
-                report(progress.stage_retrying, stage, attempts[stage] + 1)
-            return destination
-
-        return choose
-
     builder = StateGraph(WikiState)
-    builder.add_node("init", wrap_stage("init", init))
-    builder.add_node("ingest", wrap_stage("ingest", run_ingest))
-    builder.add_node("verify", wrap_stage("verify", verify))
-    builder.add_node("retrieve", wrap_stage("retrieve", retrieve))
+    builder.add_node("init", wrap_stage("init", init), retry_policy=retry_policy)
+    builder.add_node("ingest", wrap_stage("ingest", run_ingest), retry_policy=retry_policy)
+    builder.add_node("verify", wrap_stage("verify", verify), retry_policy=retry_policy)
+    builder.add_node("retrieve", wrap_stage("retrieve", retrieve), retry_policy=retry_policy)
 
     builder.add_edge(START, "init")
-    builder.add_conditional_edges(
-        "init",
-        route("init", next_init),
-        {"next": "ingest", "retry": "init"},
-    )
-    builder.add_conditional_edges(
-        "ingest",
-        route("ingest", next_ingest),
-        {"next": "verify", "retry": "ingest"},
-    )
-    builder.add_conditional_edges(
-        "verify",
-        route("verify", next_verify),
-        {"next": "retrieve", "retry": "verify"},
-    )
-    builder.add_conditional_edges(
-        "retrieve",
-        route("retrieve", next_retrieve),
-        {"next": END, "retry": "retrieve"},
-    )
+    builder.add_edge("init", "ingest")
+    builder.add_edge("ingest", "verify")
+    builder.add_edge("verify", "retrieve")
+    builder.add_edge("retrieve", END)
     return builder.compile()
 
 

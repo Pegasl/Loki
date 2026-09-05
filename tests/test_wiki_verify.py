@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from llm_wiki.wiki import wiki_verify
+from llm_wiki.wiki import wiki_register, wiki_verify
 
 
 class WikiVerifyTests(unittest.TestCase):
@@ -53,7 +53,7 @@ class WikiVerifyTests(unittest.TestCase):
                     'description: "A source summary"',
                     f'source: "{source_path}"',
                     f'srcid: "{srcid}"',
-                    f'source_hash: "sha256:{digest}"',
+                    f'source_hash: "{digest}"',
                     "---",
                     "Summary body.",
                 ]
@@ -93,8 +93,8 @@ class WikiVerifyTests(unittest.TestCase):
             .replace('source: "../../raw/topic.txt"', 'source: "wrong.txt"')
             .replace('srcid: "srcid-abc123"', 'srcid: "srcid-wrong"')
             .replace(
-                f'source_hash: "sha256:{registration["sha256"]}"',
-                'source_hash: "sha256:wrong"',
+                f'source_hash: "{registration["sha256"]}"',
+                'source_hash: "wrong"',
             ),
             encoding="utf-8",
         )
@@ -235,6 +235,25 @@ class WikiVerifyTests(unittest.TestCase):
         self.write_sources([registration])
 
         self.assertTrue(wiki_verify(self.root))
+
+    def test_register_writes_source_hash_without_algorithm_prefix(self) -> None:
+        source = self.raw / "topic.txt"
+        source.write_text("registered source\n", encoding="utf-8")
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+
+        self.assertTrue(wiki_register(self.root))
+
+        registration = json.loads(
+            (self.wiki / "sources.json").read_text(encoding="utf-8")
+        )[0]
+        summary = (
+            self.wiki / source.stem
+            / f"source-summary-{registration['srcid'].removeprefix('srcid-')}.md"
+        )
+        summary_text = summary.read_text(encoding="utf-8")
+
+        self.assertIn(f'source_hash: "{digest}"', summary_text)
+        self.assertNotIn(f'source_hash: "sha256:{digest}"', summary_text)
 
 
 if __name__ == "__main__":

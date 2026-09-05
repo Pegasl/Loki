@@ -2,7 +2,7 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
@@ -134,6 +134,83 @@ class WorkflowProgressTests(unittest.TestCase):
 
         self.assertEqual(result, {"verify": False})
         verify.assert_called_once_with()
+
+    def test_graph_skips_completed_stages(self) -> None:
+        for completed in (set(STATE), {"init", "ingest"}, {"verify"}):
+            with self.subTest(completed=completed), ExitStack() as stack:
+                save = stack.enter_context(patch.object(workflow, "save_state"))
+                nodes = {
+                    stage: stack.enter_context(patch.object(
+                        workflow, stage, return_value={stage: True}
+                    ))
+                    for stage in STATE
+                }
+                reporter = Mock(spec=workflow.ProgressReporter)
+                result = workflow.build_graph(reporter).invoke({
+                    stage: stage in completed for stage in STATE
+                })
+                self.assertTrue(all(result.values()))
+                for stage, node in nodes.items():
+                    self.assertEqual(node.call_count, int(stage not in completed))
+                self.assertEqual(reporter.stage_started.call_args_list, [
+                    call(stage, 1) for stage in STATE if stage not in completed
+                ])
+                self.assertEqual(save.call_count, len(STATE) - len(completed))
+
+    def test_native_retries_stop_after_five_retries_for_each_node(self) -> None:
+        real_policy = workflow.RetryPolicy
+        for failed_stage in STATE:
+            with self.subTest(stage=failed_stage), ExitStack() as stack:
+                stack.enter_context(patch.object(workflow, "save_state"))
+                stack.enter_context(patch.object(
+                    workflow, "RetryPolicy",
+                    side_effect=lambda **kwargs: real_policy(**kwargs)._replace(
+                        initial_interval=0, jitter=False
+                    ),
+                ))
+                nodes = {
+                    stage: stack.enter_context(patch.object(
+                        workflow, stage, return_value={stage: stage != failed_stage}
+                    ))
+                    for stage in STATE
+                }
+                reporter = Mock(spec=workflow.ProgressReporter)
+                graph = workflow.build_graph(reporter)
+                for _ in range(2):
+                    for node in nodes.values():
+                        node.reset_mock()
+                    reporter.reset_mock()
+                    with self.assertRaises(workflow.NodeFailedError):
+                        graph.invoke(STATE)
+                    self.assertEqual(nodes[failed_stage].call_count, 6)
+                    self.assertEqual(reporter.stage_retrying.call_args_list, [
+                        call(failed_stage, attempt) for attempt in range(2, 7)
+                    ])
+                    stages = list(STATE)
+                    for stage in stages[stages.index(failed_stage) + 1:]:
+                        nodes[stage].assert_not_called()
+
+    def test_native_retries_can_succeed_on_last_attempt(self) -> None:
+        real_policy = workflow.RetryPolicy
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(workflow, "save_state"))
+            stack.enter_context(patch.object(
+                workflow, "RetryPolicy",
+                side_effect=lambda **kwargs: real_policy(**kwargs)._replace(
+                    initial_interval=0, jitter=False
+                ),
+            ))
+            nodes = {
+                stage: stack.enter_context(patch.object(
+                    workflow, stage,
+                    side_effect=[{stage: False}] * 5 + [{stage: True}],
+                ))
+                for stage in STATE
+            }
+            result = workflow.build_graph().invoke(STATE)
+        self.assertTrue(all(result.values()))
+        for node in nodes.values():
+            self.assertEqual(node.call_count, 6)
 
     def test_graph_reports_stage_lifecycle(self) -> None:
         reporter = Mock(spec=workflow.ProgressReporter)
