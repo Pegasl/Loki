@@ -89,8 +89,10 @@ def ingest(
     return {"ingest": all(results)}
 
 
-def verify(state: WikiState) -> dict[str, bool]:
-    return {"verify": wiki_verify()}
+def verify(
+    state: WikiState, reporter: ProgressReporter | None = None
+) -> dict[str, bool]:
+    return {"verify": wiki_verify(fix=True, reporter=reporter)}
 
 
 def retrieve(state: WikiState) -> dict[str, bool]:
@@ -137,10 +139,14 @@ def build_graph(reporter: ProgressReporter | None = None):
     def run_ingest(state: WikiState) -> dict[str, bool]:
         return ingest(state, progress)
 
+    def run_verify(state: WikiState) -> dict[str, bool]:
+        return verify(state, progress)
+
     builder = StateGraph(WikiState)
     builder.add_node("init", wrap_stage("init", init), retry_policy=retry_policy)
     builder.add_node("ingest", wrap_stage("ingest", run_ingest), retry_policy=retry_policy)
-    builder.add_node("verify", wrap_stage("verify", verify), retry_policy=retry_policy)
+    builder.add_node("verify", wrap_stage("verify", run_verify),
+                     retry_policy=RetryPolicy(max_attempts=1))
     builder.add_node("retrieve", wrap_stage("retrieve", retrieve), retry_policy=retry_policy)
 
     builder.add_edge(START, "init")

@@ -4,7 +4,12 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+from langchain_core.messages import AIMessage
+
+from llm_wiki.progress import ProgressReporter
+from llm_wiki.wiki_fix import _fix_tools
 
 from llm_wiki.wiki import wiki_register, wiki_verify
 
@@ -235,6 +240,195 @@ class WikiVerifyTests(unittest.TestCase):
         self.write_sources([registration])
 
         self.assertTrue(wiki_verify(self.root))
+
+    def prepare_repair(self):
+        registration, document = self.add_source("topic.txt", "srcid-abc123")
+        self.write_sources([registration])
+        page = document / "concepts" / "topic.md"
+        original = page.read_text(encoding="utf-8")
+        page.write_text(original.replace('description: "A topic"', 'description: ""'), encoding="utf-8")
+        return registration, document, page, original
+
+    def mock_model(self, responses):
+        model = Mock()
+        model.bind_tools.return_value.invoke.side_effect = responses
+        self.enterContext(patch.dict(os.environ, {
+            "MODEL_NAME": "fake", "OPENAI_API_KEY": "fake",
+            "OPENAI_BASE_URL": "https://example.invalid",
+        }))
+        constructor = self.enterContext(patch("langchain_openai.ChatOpenAI", return_value=model))
+        return model.bind_tools.return_value, constructor
+
+    @staticmethod
+    def write_response(path, content):
+        return AIMessage(content="", tool_calls=[{
+            "name": "write_file", "args": {"path": path, "content": content},
+            "id": "fix-write", "type": "tool_call",
+        }])
+
+    def test_fix_repairs_page_then_rechecks_and_records_progress(self) -> None:
+        _, _, page, original = self.prepare_repair()
+        reporter = Mock(spec=ProgressReporter)
+        model, constructor = self.mock_model([
+            self.write_response("concepts/topic.md", original), AIMessage(content="done"),
+        ])
+        self.assertTrue(wiki_verify(self.root, fix=True, reporter=reporter))
+        self.assertEqual(page.read_text(), original)
+        self.assertEqual(model.invoke.call_count, 2)
+        self.assertEqual(constructor.call_args.kwargs["max_retries"], 0)
+        reporter.agent_started.assert_called_once_with("fix")
+        reporter.agent_succeeded.assert_called_once_with("fix")
+        reporter.tool_succeeded.assert_called_once_with("write_file", "fix-write")
+        log = self.log.read_text()
+        self.assertIn("concepts/topic.md: description is empty", log)
+        self.assertIn("fix | topic.txt", log)
+        self.assertIn("Written: `concepts/topic.md`", log)
+        self.assertIn("recheck | topic.txt", log)
+        self.assertIn("Status: `passed`", log.split("recheck |", 1)[1])
+        prompt = json.loads(model.invoke.call_args.args[0][1].content)
+        self.assertEqual(prompt["issues"][0]["file"], "concepts/topic.md")
+        self.assertEqual(prompt["original_source"], "content for topic.txt\n")
+
+    def test_agent_claiming_success_does_not_pass_or_retry(self) -> None:
+        self.prepare_repair()
+        model, _ = self.mock_model([AIMessage(content="Everything is fixed")])
+        self.assertFalse(wiki_verify(self.root, fix=True))
+        self.assertEqual(model.invoke.call_count, 1)
+        self.assertIn("Status: `failed`", self.log.read_text().split("recheck |", 1)[1])
+
+    def test_default_verify_does_not_call_fix(self) -> None:
+        self.prepare_repair()
+        with patch("llm_wiki.wiki_fix.fix_source") as fix:
+            self.assertFalse(wiki_verify(self.root))
+        fix.assert_not_called()
+
+    def test_valid_source_does_not_call_fix(self) -> None:
+        _, _, page, original = self.prepare_repair()
+        page.write_text(original)
+        with patch("llm_wiki.wiki_fix.fix_source") as fix:
+            self.assertTrue(wiki_verify(self.root, fix=True))
+        fix.assert_not_called()
+
+    def test_changed_raw_blocks_repair_even_with_page_errors(self) -> None:
+        self.prepare_repair()
+        (self.raw / "topic.txt").write_text("changed source")
+        with patch("llm_wiki.wiki_fix.fix_source") as fix:
+            self.assertFalse(wiki_verify(self.root, fix=True))
+        fix.assert_not_called()
+
+    def test_missing_raw_and_broken_registry_do_not_call_fix(self) -> None:
+        self.prepare_repair()
+        (self.raw / "topic.txt").unlink()
+        with patch("llm_wiki.wiki_fix.fix_source") as fix:
+            self.assertFalse(wiki_verify(self.root, fix=True))
+            (self.wiki / "sources.json").write_text("not JSON")
+            self.assertFalse(wiki_verify(self.root, fix=True))
+        fix.assert_not_called()
+
+    def test_ambiguous_directory_and_duplicate_registration_do_not_call_fix(self) -> None:
+        registration, document, _, _ = self.prepare_repair()
+        self.write_sources([registration, registration])
+        with patch("llm_wiki.wiki_fix.fix_source") as fix:
+            self.assertFalse(wiki_verify(self.root, fix=True))
+            self.write_sources([registration])
+            other = self.wiki / "topic-srcid-abc123"
+            other.mkdir()
+            (other / "source-summary-abc123.md").write_text(
+                (document / "source-summary-abc123.md").read_text()
+            )
+            self.assertFalse(wiki_verify(self.root, fix=True))
+        fix.assert_not_called()
+
+    def test_shared_or_symlinked_source_directory_blocks_fix(self) -> None:
+        first, document, _, _ = self.prepare_repair()
+        summary = document / "source-summary-abc123.md"
+        summary.unlink()
+        nested_raw = self.raw / "nested" / "topic.txt"
+        nested_raw.parent.mkdir()
+        nested_raw.write_text("second source")
+        second = {"filename": "nested/topic.txt", "srcid": "srcid-second",
+                  "sha256": hashlib.sha256(nested_raw.read_bytes()).hexdigest()}
+        self.write_sources([first, second])
+        with patch("llm_wiki.wiki_fix.fix_source") as fix:
+            self.assertFalse(wiki_verify(self.root, fix=True))
+            self.assertIn("shared by multiple registrations", self.log.read_text())
+            self.write_sources([first])
+            actual = self.wiki / "other-source"
+            document.rename(actual)
+            document.symlink_to(actual, target_is_directory=True)
+            self.assertFalse(wiki_verify(self.root, fix=True))
+        fix.assert_not_called()
+
+    def test_fix_can_restore_missing_summary_and_entity(self) -> None:
+        registration, document = self.add_source("topic.txt", "srcid-abc123")
+        self.write_sources([registration])
+        summary = document / "source-summary-abc123.md"
+        summary_text = summary.read_text()
+        summary.unlink()
+        entity = document / "entities" / "person.md"
+        entity_text = entity.read_text()
+        entity.unlink()
+        entity.parent.rmdir()
+        self.mock_model([
+            self.write_response(summary.name, summary_text),
+            self.write_response("entities/person.md", entity_text),
+            AIMessage(content="done"),
+        ])
+        self.assertTrue(wiki_verify(self.root, fix=True))
+        self.assertEqual(summary.read_text(), summary_text + "\n")
+        self.assertEqual(entity.read_text(), entity_text)
+
+    def test_fix_failure_continues_to_other_source_and_full_recheck(self) -> None:
+        first, _, _, _ = self.prepare_repair()
+        second, document = self.add_source("second.txt", "srcid-second")
+        self.write_sources([first, second])
+        page = document / "entities" / "person.md"
+        original = page.read_text()
+        page.write_text(original.replace('description: "A person"', 'description: ""'))
+        reporter = Mock(spec=ProgressReporter)
+        model, _ = self.mock_model([
+            RuntimeError("model failed"),
+            self.write_response("entities/person.md", original), AIMessage(content="done"),
+        ])
+        self.assertFalse(wiki_verify(self.root, fix=True, reporter=reporter))
+        self.assertEqual(model.invoke.call_count, 3)
+        reporter.agent_failed.assert_called_once()
+        self.assertEqual(page.read_text(), original)
+        log = self.log.read_text()
+        self.assertIn("recheck | topic.txt", log)
+        self.assertIn("recheck | second.txt", log)
+
+    def test_fix_model_turns_are_bounded(self) -> None:
+        self.prepare_repair()
+        response = AIMessage(content="", tool_calls=[{
+            "name": "list_files", "args": {}, "id": "list", "type": "tool_call",
+        }])
+        model, _ = self.mock_model([response] * 12)
+        self.assertFalse(wiki_verify(self.root, fix=True))
+        self.assertEqual(model.invoke.call_count, 12)
+        self.assertIn("exceeded 12 model turns", self.log.read_text())
+
+    def test_fix_tools_reject_unrelated_files_and_path_escape(self) -> None:
+        _, document, _, _ = self.prepare_repair()
+        outside = self.root / "outside.md"
+        outside.write_text("keep")
+        (document / "concepts" / "linked.md").symlink_to(outside)
+        written = []
+        tools = {item.name: item for item in _fix_tools(document, [
+            {"file": "concepts/topic.md"}, {"file": "concepts/linked.md"},
+            {"file": "entities/"}, {"file": "index.md"},
+        ], written)}
+        for path in ("../../raw/topic.txt", "../sources.json", "../aliases.json",
+                     "index.md", "entities/person.md", "concepts/unrelated.md",
+                     "concepts/linked.md", str(outside)):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                tools["write_file"].invoke({"path": path, "content": "bad"})
+        with self.assertRaises(ValueError):
+            tools["read_file"].invoke({"path": "concepts/linked.md"})
+        with self.assertRaises(ValueError):
+            tools["mkdir"].invoke({"path": "findings"})
+        self.assertEqual(outside.read_text(), "keep")
+        self.assertEqual(written, [])
 
     def test_register_writes_source_hash_without_algorithm_prefix(self) -> None:
         source = self.raw / "topic.txt"

@@ -133,7 +133,7 @@ class WorkflowProgressTests(unittest.TestCase):
             result = workflow.verify(STATE)
 
         self.assertEqual(result, {"verify": False})
-        verify.assert_called_once_with()
+        verify.assert_called_once_with(fix=True, reporter=None)
 
     def test_graph_skips_completed_stages(self) -> None:
         for completed in (set(STATE), {"init", "ingest"}, {"verify"}):
@@ -157,7 +157,7 @@ class WorkflowProgressTests(unittest.TestCase):
                 ])
                 self.assertEqual(save.call_count, len(STATE) - len(completed))
 
-    def test_native_retries_stop_after_five_retries_for_each_node(self) -> None:
+    def test_native_retries_stop_and_verify_is_attempted_only_once(self) -> None:
         real_policy = workflow.RetryPolicy
         for failed_stage in STATE:
             with self.subTest(stage=failed_stage), ExitStack() as stack:
@@ -182,9 +182,10 @@ class WorkflowProgressTests(unittest.TestCase):
                     reporter.reset_mock()
                     with self.assertRaises(workflow.NodeFailedError):
                         graph.invoke(STATE)
-                    self.assertEqual(nodes[failed_stage].call_count, 6)
+                    attempts = 1 if failed_stage == "verify" else 6
+                    self.assertEqual(nodes[failed_stage].call_count, attempts)
                     self.assertEqual(reporter.stage_retrying.call_args_list, [
-                        call(failed_stage, attempt) for attempt in range(2, 7)
+                        call(failed_stage, attempt) for attempt in range(2, attempts + 1)
                     ])
                     stages = list(STATE)
                     for stage in stages[stages.index(failed_stage) + 1:]:
@@ -203,14 +204,14 @@ class WorkflowProgressTests(unittest.TestCase):
             nodes = {
                 stage: stack.enter_context(patch.object(
                     workflow, stage,
-                    side_effect=[{stage: False}] * 5 + [{stage: True}],
+                    side_effect=([{stage: False}] * 5 if stage != "verify" else []) + [{stage: True}],
                 ))
                 for stage in STATE
             }
             result = workflow.build_graph().invoke(STATE)
         self.assertTrue(all(result.values()))
-        for node in nodes.values():
-            self.assertEqual(node.call_count, 6)
+        for stage, node in nodes.items():
+            self.assertEqual(node.call_count, 1 if stage == "verify" else 6)
 
     def test_graph_reports_stage_lifecycle(self) -> None:
         reporter = Mock(spec=workflow.ProgressReporter)

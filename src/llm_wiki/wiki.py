@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import secrets
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -313,63 +314,55 @@ def _wiki_document(
     return None, wiki / summary_name, "registered Wiki directory does not exist"
 
 
-def wiki_verify(root: str | Path = ".") -> bool:
-    """Verify every registered raw source without stopping after failures."""
+def _verify_sources(root: Path) -> list[dict]:
+    """Collect this run's source results and structured issues without writing files."""
     root = Path(root).expanduser().resolve()
     raw = root / "raw"
     wiki = root / "wiki"
     sources_file = wiki / "sources.json"
-    log_file = wiki / "workflow-log" / "verify-log.md"
-    events: list[str] = []
-    all_valid = True
+    results: list[dict] = []
 
-    def clean(value: object) -> str:
-        return " ".join(str(value).replace("`", "'").split())
+    def issue(message: str, file: str | None = None, repairable: bool = False) -> dict:
+        return {"file": file, "message": message, "repairable": repairable}
 
-    def add_event(filename: object, srcid: object, errors: list[str] | None = None) -> None:
-        lines = [
-            f"## [{datetime.now().astimezone().date().isoformat()}] verify | {clean(filename)}",
-            "",
-            f"- SrcID: `{clean(srcid)}`",
-            f"- Status: `{'failed' if errors else 'passed'}`",
-        ]
-        lines.extend(f"- Error: {clean(error)}" for error in errors or [])
-        events.append("\n".join(lines))
+    def add_event(filename, srcid, errors=None, **context) -> None:
+        results.append({"filename": filename, "srcid": srcid,
+                        "errors": errors or [], **context})
 
     try:
         registrations = json.loads(sources_file.read_text(encoding="utf-8"))
         if not isinstance(registrations, list):
             raise ValueError("wiki/sources.json must contain a JSON list")
     except Exception as error:
-        add_event("sources.json", "unknown", [str(error)])
+        add_event("sources.json", "unknown", [issue(str(error))])
         registrations = []
-        all_valid = False
 
     valid_registrations: list[dict[str, str]] = []
     registered_filenames: set[str] = set()
     for index, registration in enumerate(registrations):
         errors = []
         if not isinstance(registration, dict):
-            add_event(f"sources.json entry {index}", "unknown", ["source registration must be an object"])
-            all_valid = False
+            add_event(f"sources.json entry {index}", "unknown", [issue("source registration must be an object")])
             continue
         filename = registration.get("filename")
         srcid = registration.get("srcid")
         digest = registration.get("sha256")
         if not isinstance(filename, str) or not filename.strip():
-            errors.append("registration filename must be a non-empty string")
+            errors.append(issue("registration filename must be a non-empty string"))
         if not isinstance(srcid, str) or not srcid.strip():
-            errors.append("registration srcid must be a non-empty string")
+            errors.append(issue("registration srcid must be a non-empty string"))
         if not isinstance(digest, str) or len(digest) != 64 or any(
             character not in "0123456789abcdef" for character in digest
         ):
-            errors.append("registration sha256 must be 64 lowercase hexadecimal characters")
+            errors.append(issue("registration sha256 must be 64 lowercase hexadecimal characters"))
         if errors:
             add_event(filename or f"sources.json entry {index}", srcid or "unknown", errors)
-            all_valid = False
             continue
         valid_registrations.append({"filename": filename, "srcid": srcid, "sha256": digest})
         registered_filenames.add(filename)
+
+    srcid_counts = Counter(item["srcid"] for item in valid_registrations)
+    filename_counts = Counter(item["filename"] for item in valid_registrations)
 
     raw_files = sorted(
         path for path in raw.rglob("*")
@@ -378,40 +371,50 @@ def wiki_verify(root: str | Path = ".") -> bool:
     for path in raw_files:
         filename = path.relative_to(raw).as_posix()
         if filename not in registered_filenames:
-            add_event(filename, "unregistered", ["raw file is not registered in sources.json"])
-            all_valid = False
+            add_event(filename, "unregistered", [issue("raw file is not registered in sources.json")])
 
     for registration in valid_registrations:
         filename = registration["filename"]
         srcid = registration["srcid"]
         digest = registration["sha256"]
-        errors: list[str] = []
+        errors: list[dict] = []
+        if srcid_counts[srcid] > 1 or filename_counts[filename] > 1:
+            errors.append(issue("duplicate source registration"))
         source_file = (raw / filename).resolve()
         if not source_file.is_relative_to(raw.resolve()):
-            errors.append("registered source path escapes raw directory")
+            errors.append(issue("registered source path escapes raw directory"))
         elif not source_file.is_file():
-            errors.append("registered source file does not exist")
+            errors.append(issue("registered source file does not exist"))
         else:
             try:
                 actual_digest = hashlib.sha256(source_file.read_bytes()).hexdigest()
                 if actual_digest != digest:
-                    errors.append(f"raw SHA256 does not match registration (expected {digest}, found {actual_digest})")
+                    errors.append(issue(f"raw SHA256 does not match registration (expected {digest}, found {actual_digest})"))
             except OSError as error:
-                errors.append(f"unable to read registered source: {error}")
+                errors.append(issue(f"unable to read registered source: {error}"))
 
         document, summary, document_error = _wiki_document(wiki, filename, srcid)
         if document_error:
-            errors.append(document_error)
+            errors.append(issue(document_error))
+        if document is not None and not document.resolve().is_relative_to(wiki.resolve()):
+            errors.append(issue("registered Wiki directory escapes wiki directory"))
+            document = None
+        if document is not None and (document.is_symlink() or document.resolve() == wiki.resolve()):
+            errors.append(issue("registered Wiki directory is not an isolated source directory"))
+            document = None
         if document is not None:
             markdown_files = sorted(document.rglob("*.md"))
             parsed_files: dict[Path, tuple[dict[str, object], str]] = {}
             if not summary.is_file():
-                errors.append(f"missing Source Summary: {summary.name}")
+                errors.append(issue(f"missing Source Summary: {summary.name}", summary.name, True))
             if any(path != summary for path in document.glob("source-summary-*.md")):
-                errors.append("document contains an unexpected additional Source Summary")
+                errors.append(issue("document contains an unexpected additional Source Summary"))
 
             for markdown_file in markdown_files:
                 relative = markdown_file.relative_to(document).as_posix()
+                if not markdown_file.resolve().is_relative_to(document.resolve()):
+                    errors.append(issue("page path escapes registered Wiki directory", relative))
+                    continue
                 try:
                     parsed = _parse_frontmatter(markdown_file.read_text(encoding="utf-8"))
                     parsed_files[markdown_file] = parsed
@@ -419,11 +422,13 @@ def wiki_verify(root: str | Path = ".") -> bool:
                     for field in ("type", "description"):
                         value = frontmatter.get(field)
                         if not isinstance(value, str) or not value.strip():
-                            errors.append(f"{relative}: {field} is empty")
+                            errors.append(issue(f"{field} is empty", relative, True))
                     if not body:
-                        errors.append(f"{relative}: body is empty")
-                except (OSError, UnicodeError, ValueError) as error:
-                    errors.append(f"{relative}: {error}")
+                        errors.append(issue("body is empty", relative, True))
+                except (OSError, UnicodeError) as error:
+                    errors.append(issue(str(error), relative))
+                except ValueError as error:
+                    errors.append(issue(str(error), relative, True))
 
             if summary in parsed_files:
                 frontmatter, _ = parsed_files[summary]
@@ -435,30 +440,101 @@ def wiki_verify(root: str | Path = ".") -> bool:
                 }
                 for field, expected_value in expected.items():
                     if frontmatter.get(field) != expected_value:
-                        errors.append(f"{summary.name}: {field} does not match registration (expected {expected_value})")
+                        errors.append(issue(f"{field} does not match registration (expected {expected_value})", summary.name, True))
 
             if not any(
                 path.is_relative_to(document / "concepts") and frontmatter.get("type") == "Concept"
                 for path, (frontmatter, _) in parsed_files.items()
             ):
-                errors.append("document has no Concept page below concepts/")
+                errors.append(issue("document has no Concept page below concepts/", "concepts/", True))
             if not any(
                 path.is_relative_to(document / "entities") and frontmatter.get("type") == "Entity"
                 for path, (frontmatter, _) in parsed_files.items()
             ):
-                errors.append("document has no Entity page below entities/")
+                errors.append(issue("document has no Entity page below entities/", "entities/", True))
 
-        add_event(filename, srcid, errors)
-        all_valid = all_valid and not errors
+        add_event(filename, srcid, errors, registration=registration,
+                  document=document, summary=summary)
 
+    document_counts = Counter(
+        result["document"].resolve() for result in results if result.get("document") is not None
+    )
+    for result in results:
+        document = result.get("document")
+        if document is not None and document_counts[document.resolve()] > 1:
+            result["errors"].append(issue("Wiki directory is shared by multiple registrations"))
+
+    return results
+
+
+def _append_verify_log(root: Path, results: list[dict], phase: str = "verify") -> bool:
+    def clean(value: object) -> str:
+        return " ".join(str(value).replace("`", "'").split())
+
+    events = []
+    for result in results:
+        status = "failed" if result["errors"] else ("completed" if phase == "fix" else "passed")
+        lines = [
+            f"## [{datetime.now().astimezone().date().isoformat()}] {phase} | {clean(result['filename'])}",
+            "",
+            f"- SrcID: `{clean(result['srcid'])}`",
+            f"- Status: `{status}`",
+        ]
+        for error in result["errors"]:
+            location = f"{error['file']}: " if error.get("file") else ""
+            lines.append(f"- Error: {clean(location + error['message'])}")
+        lines.extend(f"- Written: `{clean(path)}`" for path in result.get("written_files", []))
+        events.append("\n".join(lines))
     try:
+        log_file = root / "wiki" / "workflow-log" / "verify-log.md"
         log_file.parent.mkdir(parents=True, exist_ok=True)
         old_log = log_file.read_text(encoding="utf-8").rstrip() if log_file.exists() else ""
         content = "\n\n".join(part for part in [old_log, *events] if part)
         log_file.write_text(content + ("\n" if content else ""), encoding="utf-8")
     except OSError:
         return False
-    return all_valid
+    return True
+
+
+def wiki_verify(
+    root: str | Path = ".", *, fix: bool = False,
+    reporter: ProgressReporter | None = None,
+) -> bool:
+    """Check all sources, optionally repair each eligible source once, then recheck."""
+    root = Path(root).expanduser().resolve()
+    results = _verify_sources(root)
+    if not _append_verify_log(root, results):
+        return False
+    if not any(result["errors"] for result in results):
+        return True
+    if not fix:
+        return False
+
+    from .wiki_fix import fix_source
+
+    attempted = False
+    logs_ok = True
+    for result in results:
+        errors = result["errors"]
+        if not errors or not all(error["repairable"] for error in errors):
+            continue
+        attempted = True
+        written_files: list[str] = []
+        fix_errors = []
+        try:
+            fix_source(root, result, written_files, reporter=reporter)
+        except Exception as error:
+            fix_errors.append({"file": None, "message": str(error)})
+        logs_ok = _append_verify_log(root, [{
+            **result, "errors": fix_errors, "written_files": written_files,
+        }], phase="fix") and logs_ok
+
+    if not attempted:
+        return False
+    # The checker decides success, including after a partially completed agent run.
+    results = _verify_sources(root)
+    logs_ok = _append_verify_log(root, results, phase="recheck") and logs_ok
+    return logs_ok and not any(result["errors"] for result in results)
 
 
 def wiki_ingest(srcid: str, reporter: ProgressReporter | None = None) -> bool:
