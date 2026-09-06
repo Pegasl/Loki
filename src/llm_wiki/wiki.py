@@ -403,7 +403,9 @@ def _verify_sources(root: Path) -> list[dict]:
             errors.append(issue("registered Wiki directory is not an isolated source directory"))
             document = None
         if document is not None:
-            markdown_files = sorted(document.rglob("*.md"))
+            markdown_files = sorted(
+                path for path in document.rglob("*.md") if path.name != "index.md"
+            )
             parsed_files: dict[Path, tuple[dict[str, object], str]] = {}
             if not summary.is_file():
                 errors.append(issue(f"missing Source Summary: {summary.name}", summary.name, True))
@@ -535,6 +537,48 @@ def wiki_verify(
     results = _verify_sources(root)
     logs_ok = _append_verify_log(root, results, phase="recheck") and logs_ok
     return logs_ok and not any(result["errors"] for result in results)
+
+
+def wiki_index(root: str | Path = ".") -> bool:
+    """Index Markdown filenames and descriptions, and source folders under wiki/."""
+    wiki = Path(root).expanduser().resolve() / "wiki"
+
+    def entry(name: str, page: Path) -> str:
+        frontmatter, _ = _parse_frontmatter(page.read_text(encoding="utf-8"))
+        description = frontmatter.get("description")
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError(f"{page}: description is empty")
+        return f"- {name}: {' '.join(description.split())}\n"
+
+    try:
+        indexes: dict[Path, str] = {}
+        source_entries = []
+        for document in sorted(wiki.iterdir()):
+            if not document.is_dir() or document.name == "workflow-log":
+                continue
+            summaries = sorted(document.glob("source-summary-*.md"))
+            if not summaries:
+                continue
+            if len(summaries) != 1:
+                raise ValueError(f"{document}: expected one Source Summary")
+            source_entries.append(entry(document.name, summaries[0]))
+            directories = [document, *sorted(
+                path for path in document.rglob("*") if path.is_dir()
+            )]
+            for directory in directories:
+                pages = sorted(
+                    path for path in directory.glob("*.md")
+                    if path.is_file() and path.name != "index.md"
+                )
+                indexes[directory / "index.md"] = "".join(
+                    entry(page.name, page) for page in pages
+                )
+        indexes[wiki / "index.md"] = "".join(source_entries)
+        for path, content in indexes.items():
+            path.write_text(content, encoding="utf-8")
+    except (OSError, UnicodeError, ValueError):
+        return False
+    return True
 
 
 def wiki_ingest(srcid: str, reporter: ProgressReporter | None = None) -> bool:

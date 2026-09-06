@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 from typing import Callable, TypedDict
 
@@ -12,7 +13,7 @@ from .progress import (
     TerminalProgressReporter,
     report,
 )
-from .wiki import wiki_ingest, wiki_init, wiki_register, wiki_verify
+from .wiki import wiki_index, wiki_ingest, wiki_init, wiki_register, wiki_verify
 
 
 class NodeFailedError(RuntimeError):
@@ -23,6 +24,7 @@ class WikiState(TypedDict):
     init: bool
     ingest: bool
     verify: bool
+    index: bool
     retrieve: bool
 
 
@@ -95,6 +97,13 @@ def verify(
     return {"verify": wiki_verify(fix=True, reporter=reporter)}
 
 
+def index(state: WikiState) -> dict[str, bool]:
+    if not wiki_index():
+        return {"index": False}
+    subprocess.run(["qmd", "embed"], cwd=root, check=True)
+    return {"index": True}
+
+
 def retrieve(state: WikiState) -> dict[str, bool]:
     # if
     #     return {"retrieve": True}
@@ -147,12 +156,14 @@ def build_graph(reporter: ProgressReporter | None = None):
     builder.add_node("ingest", wrap_stage("ingest", run_ingest), retry_policy=retry_policy)
     builder.add_node("verify", wrap_stage("verify", run_verify),
                      retry_policy=RetryPolicy(max_attempts=1))
+    builder.add_node("index", wrap_stage("index", index), retry_policy=retry_policy)
     builder.add_node("retrieve", wrap_stage("retrieve", retrieve), retry_policy=retry_policy)
 
     builder.add_edge(START, "init")
     builder.add_edge("init", "ingest")
     builder.add_edge("ingest", "verify")
-    builder.add_edge("verify", "retrieve")
+    builder.add_edge("verify", "index")
+    builder.add_edge("index", "retrieve")
     builder.add_edge("retrieve", END)
     return builder.compile()
 
@@ -169,6 +180,7 @@ def main() -> None:
             "init": False,
             "ingest": False,
             "verify": False,
+            "index": False,
             "retrieve": False,
         }
         wiki.mkdir(exist_ok=True)

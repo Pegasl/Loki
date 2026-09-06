@@ -11,7 +11,7 @@ from langchain_core.messages import AIMessage
 from llm_wiki.progress import ProgressReporter
 from llm_wiki.wiki_fix import _fix_tools
 
-from llm_wiki.wiki import wiki_register, wiki_verify
+from llm_wiki.wiki import wiki_index, wiki_register, wiki_verify
 
 
 class WikiVerifyTests(unittest.TestCase):
@@ -88,6 +88,12 @@ class WikiVerifyTests(unittest.TestCase):
         log = self.log.read_text(encoding="utf-8")
         self.assertIn("verify | notes/topic.txt", log)
         self.assertIn("- Status: `passed`", log)
+
+    def test_generated_indexes_do_not_fail_verification(self) -> None:
+        registration, _ = self.add_source("topic.txt", "srcid-abc123")
+        self.write_sources([registration])
+        self.assertTrue(wiki_index(self.root))
+        self.assertTrue(wiki_verify(self.root))
 
     def test_summary_registration_mismatches_are_all_logged(self) -> None:
         registration, document = self.add_source("topic.txt", "srcid-abc123")

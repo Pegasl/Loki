@@ -1,5 +1,6 @@
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from contextlib import ExitStack, redirect_stdout
@@ -9,7 +10,10 @@ from unittest.mock import Mock, call, patch
 from llm_wiki import workflow
 
 
-STATE = {"init": False, "ingest": False, "verify": False, "retrieve": False}
+STATE = {
+    "init": False, "ingest": False, "verify": False,
+    "index": False, "retrieve": False,
+}
 
 
 class WorkflowProgressTests(unittest.TestCase):
@@ -157,6 +161,47 @@ class WorkflowProgressTests(unittest.TestCase):
                 ])
                 self.assertEqual(save.call_count, len(STATE) - len(completed))
 
+    def test_index_runs_embed_and_propagates_failure(self) -> None:
+        with (
+            patch.object(workflow, "wiki_index", return_value=True),
+            patch.object(workflow.subprocess, "run") as run,
+        ):
+            self.assertEqual(workflow.index(STATE), {"index": True})
+        run.assert_called_once_with(["qmd", "embed"], cwd=workflow.root, check=True)
+        for error in (FileNotFoundError("qmd"), subprocess.CalledProcessError(1, "qmd")):
+            with (
+                self.subTest(error=error),
+                patch.object(workflow, "wiki_index", return_value=True),
+                patch.object(workflow.subprocess, "run", side_effect=error),
+            ):
+                with self.assertRaises(type(error)):
+                    workflow.index(STATE)
+
+    def test_index_failure_skips_embed(self) -> None:
+        with (
+            patch.object(workflow, "wiki_index", return_value=False),
+            patch.object(workflow.subprocess, "run") as run,
+        ):
+            self.assertEqual(workflow.index(STATE), {"index": False})
+        run.assert_not_called()
+
+    def test_old_completed_state_still_runs_index_then_embed(self) -> None:
+        old_state = {stage: True for stage in ("init", "ingest", "verify", "retrieve")}
+        calls = Mock()
+        with (
+            patch.object(workflow, "save_state"),
+            patch.object(workflow, "wiki_index", return_value=True) as index,
+            patch.object(workflow.subprocess, "run") as run,
+        ):
+            calls.attach_mock(index, "index")
+            calls.attach_mock(run, "embed")
+            result = workflow.build_graph().invoke(old_state)
+        self.assertTrue(result["index"])
+        self.assertNotIn("embed", result)
+        self.assertEqual(calls.mock_calls, [
+            call.index(), call.embed(["qmd", "embed"], cwd=workflow.root, check=True),
+        ])
+
     def test_native_retries_stop_and_verify_is_attempted_only_once(self) -> None:
         real_policy = workflow.RetryPolicy
         for failed_stage in STATE:
@@ -223,12 +268,14 @@ class WorkflowProgressTests(unittest.TestCase):
             patch.object(workflow, "wiki_init", return_value=True),
             patch.object(workflow, "wiki_register", return_value=True),
             patch.object(workflow, "wiki_verify", return_value=True),
+            patch.object(workflow, "wiki_index", return_value=True),
+            patch.object(workflow.subprocess, "run"),
         ):
             result = workflow.build_graph(reporter).invoke(STATE)
 
         self.assertEqual(
             result,
-            {"init": True, "ingest": True, "verify": True, "retrieve": True},
+            {stage: True for stage in STATE},
         )
         self.assertEqual(
             reporter.stage_started.call_args_list,
@@ -236,12 +283,13 @@ class WorkflowProgressTests(unittest.TestCase):
                 call("init", 1),
                 call("ingest", 1),
                 call("verify", 1),
+                call("index", 1),
                 call("retrieve", 1),
             ],
         )
         self.assertEqual(
             reporter.stage_succeeded.call_args_list,
-            [call("init"), call("ingest"), call("verify"), call("retrieve")],
+            [call(stage) for stage in STATE],
         )
         reporter.stage_failed.assert_not_called()
         reporter.stage_retrying.assert_not_called()
@@ -256,6 +304,8 @@ class WorkflowProgressTests(unittest.TestCase):
             patch.object(workflow, "wiki_init", side_effect=[False, True]),
             patch.object(workflow, "wiki_register", return_value=True),
             patch.object(workflow, "wiki_verify", return_value=True),
+            patch.object(workflow, "wiki_index", return_value=True),
+            patch.object(workflow.subprocess, "run"),
         ):
             workflow.build_graph(reporter).invoke(STATE)
 
@@ -276,6 +326,8 @@ class WorkflowProgressTests(unittest.TestCase):
             patch.object(workflow, "wiki_init", return_value=True),
             patch.object(workflow, "wiki_register", return_value=True),
             patch.object(workflow, "wiki_verify", return_value=True),
+            patch.object(workflow, "wiki_index", return_value=True),
+            patch.object(workflow.subprocess, "run"),
             patch.object(workflow, "retrieve", side_effect=[{"retrieve": False}, {"retrieve": True}]),
         ):
             result = workflow.build_graph(reporter).invoke(STATE)
