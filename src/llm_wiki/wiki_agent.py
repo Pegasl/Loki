@@ -63,13 +63,19 @@ def _resolve_file(root: Path, path: str, *, writing: bool = False) -> Path:
     return target
 
 
-def _write_file(root: Path, path: str, content: str, *, exclusive: bool = False) -> str:
+def _write_file(root: Path, path: str, content: str, *,
+                exclusive: bool = False, append: bool = False) -> str:
     target = _resolve_file(root, path, writing=True)
     # A hard link must not turn an allowed update into an outside-file update.
     if target.exists() and target.stat().st_nlink > 1:
         raise ValueError("Cannot update a hard-linked file")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("x" if exclusive else "w", encoding="utf-8") as stream:
+    if not append:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    # r+ requires an existing archive; never create a full-answer-only file.
+    mode = "r+" if append else ("x" if exclusive else "w")
+    with target.open(mode, encoding="utf-8") as stream:
+        if append:
+            stream.seek(0, os.SEEK_END)
         stream.write(content)
     return path
 
@@ -96,6 +102,11 @@ def archive_qa(root: Path, qa: dict) -> str:
     content = (f"---\ntype: query\ncreated_at: {now.isoformat()}\n---\n\n"
                f"# 问题\n\n{qa['question']}\n\n# 回答\n\n{qa['answer']}\n")
     return _write_file(root, path, content, exclusive=True)
+
+
+def append_full_answer(root: Path, path: str, answer: str) -> str:
+    """Append the exact displayed answer to this turn's existing archive."""
+    return _write_file(root, path, "\n# 完整答案\n\n" + answer + "\n", append=True)
 
 
 def parse_answer(content: str) -> dict:
@@ -162,9 +173,15 @@ def agent_nodes(root: Path, progress, output=print, *, max_turns: int = 30):
                 if state.get("retrieval_succeeded", False):
                     try:
                         path = archive_qa(root, result["wiki_qa"])
-                        output(f"已归档：{path}")
                     except (OSError, ValueError) as error:
                         output(f"问答保存失败：{error}")
+                    else:
+                        try:
+                            append_full_answer(root, path, result["answer"])
+                        except (OSError, ValueError) as error:
+                            output(f"完整答案追加失败（相关问答已保存至 {path}）：{error}")
+                        else:
+                            output(f"已归档：{path}")
                 else:
                     output("检索未成功，本轮问答未归档。")
             report_event(progress, "agent_succeeded", "ask")
