@@ -12,6 +12,9 @@ def wiki_tool_node(tools, progress):
     def report_call(request, execute):
         name = request.tool_call["name"]
         call_id = request.tool_call["id"]
+        arguments = request.tool_call.get("args", {})
+        if isinstance(arguments, dict) and isinstance(arguments.get("path"), str):
+            report_event(progress, "tool_context", call_id, arguments["path"])
         report_event(progress, "tool_started", name, call_id)
         try:
             result = execute(request)

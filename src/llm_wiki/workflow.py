@@ -17,6 +17,7 @@ from .progress import (
     ProgressReporter,
     TerminalProgressReporter,
     report,
+    report_event,
 )
 from .wiki import wiki_index, wiki_ingest, wiki_init, wiki_register, wiki_verify
 
@@ -86,6 +87,10 @@ def ingest(
         report(progress.no_pending_sources)
 
     results = []
+    report_event(progress, "sources_discovered", {
+        registration["srcid"]: registration.get("filename") or registration["srcid"]
+        for registration in registrations if registration.get("srcid") in pending_srcids
+    })
     total = len(pending_srcids)
     for index, srcid in enumerate(pending_srcids, start=1):
         report(progress.source_started, index, total, srcid)
@@ -168,6 +173,7 @@ def build_graph(reporter: ProgressReporter | None = None, *, checkpointer=None,
     def wrap_stage(stage: str, function: Callable[[WikiState], dict[str, bool]]):
         def run(state: WikiState, runtime: Runtime) -> dict[str, bool]:
             if state.get(stage) is True:
+                report_event(progress, "stage_skipped", stage)
                 return {}
             attempt = runtime.execution_info.node_attempt
             if attempt > 1:
@@ -234,9 +240,14 @@ def main() -> None:
 
     reporter = TerminalProgressReporter()
     report(reporter.workflow_started)
-    graph = build_graph(reporter, checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "wiki-cli"}, "recursion_limit": 100}
-    result = graph.invoke(initial_state, config)
+    try:
+        graph = build_graph(reporter, checkpointer=InMemorySaver())
+        result = graph.invoke(initial_state, config)
+    except BaseException as error:
+        report_event(reporter, "workflow_failed", error)
+        raise
+    report_event(reporter, "preparation_completed")
     while result.get("__interrupt__"):
         try:
             question = input(result["__interrupt__"][0].value)
