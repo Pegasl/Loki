@@ -6,7 +6,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from .progress import NullProgressReporter, ProgressReporter, report_event
+from .progress import NullProgressReporter, ProgressReporter, invoke_model, report_event
 
 
 def wiki_init(root: str | Path = ".") -> bool:
@@ -797,7 +797,7 @@ Do not write claims from other sources. When all writes are finished, return a c
         def run_agent(agent: str, model, messages: list) -> dict:
             report_event(progress, "agent_started", agent)
             try:
-                response = model.invoke(messages)
+                response = invoke_model(progress, agent, model, messages)
             except Exception as error:
                 report_event(progress, "agent_failed", agent, error)
                 raise

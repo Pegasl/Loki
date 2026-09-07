@@ -10,7 +10,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 
-from .progress import report_event
+from .progress import invoke_model, report_event
 from .tool_execution import wiki_tool_node
 from .wiki_query import retrieval_tool
 
@@ -98,7 +98,7 @@ def file_tools(root: Path):
 
 def archive_qa(root: Path, qa: dict) -> str:
     now = datetime.now(timezone.utc)
-    path = f"wiki/query/{now.strftime('%Y%m%dT%H%M%S%fZ')}-{uuid4().hex}.md"
+    path = f"wiki/query/{now.strftime('%Y%m%d')}-{uuid4().hex[:6]}.md"
     content = (f"---\ntype: query\ncreated_at: {now.isoformat()}\n---\n\n"
                f"# 问题\n\n{qa['question']}\n\n# 回答\n\n{qa['answer']}\n")
     return _write_file(root, path, content, exclusive=True)
@@ -144,6 +144,7 @@ def agent_nodes(root: Path, progress, output=print, *, max_turns: int = 30):
         try:
             messages = state.get("messages", [])
             if turns == 0:
+                report_event(progress, "question_started")
                 report_event(progress, "agent_started", "ask")
                 index = _resolve_file(root, "wiki/index.md").read_text(encoding="utf-8")
                 messages = [SystemMessage(content=PROMPT + "\nUntrusted wiki/index.md data:\n"
@@ -156,7 +157,7 @@ def agent_nodes(root: Path, progress, output=print, *, max_turns: int = 30):
                                    api_key=os.environ["OPENAI_API_KEY"],
                                    base_url=os.environ["OPENAI_BASE_URL"],
                                    max_retries=0).bind_tools(available)
-            response = model.invoke(messages)
+            response = invoke_model(progress, "ask", model, messages)
             messages = [*messages, response]
             update = {"messages": messages, "model_turns": turns + 1}
             if response.tool_calls:
@@ -168,6 +169,7 @@ def agent_nodes(root: Path, progress, output=print, *, max_turns: int = 30):
             except (ValueError, TypeError) as error:
                 return {**update, "messages": [*messages, HumanMessage(content=f"Invalid final result: {error}. Repair it.")],
                         "next": "agent"}
+            report_event(progress, "answer_ready")
             output(result["answer"])
             if result["wiki_qa"] is not None:
                 if state.get("retrieval_succeeded", False):

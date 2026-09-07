@@ -4,19 +4,21 @@ import json
 import os
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from pathlib import Path
 from urllib.parse import quote
 
 from langchain_core.tools import tool
 
-from .progress import NullProgressReporter, ProgressReporter, report_event
+from .progress import NullProgressReporter, ProgressReporter, invoke_model, report_event
 
 
 @tool
 def wiki_retrieve(question: str) -> str:
     """Retrieve local evidence for a user question using QMD and Wiki search.
 
-    Runs qmd_query, then wiki_search in the current project directory. Returns
+    Runs qmd_query and wiki_search concurrently in the current project directory. Returns
     both complete reports concatenated in that order, with citations scoped to
     each section. Raises on failure or an empty report; never returns partial
     results.
@@ -25,8 +27,13 @@ def wiki_retrieve(question: str) -> str:
 
 
 def _retrieve_report(question: str, **kwargs) -> str:
-    qmd_report = qmd_query(question, **kwargs)
-    wiki_report = wiki_search(question, **kwargs)
+    # Copy each context separately to preserve model/tool tracing in both workers.
+    # Joining the workers also prevents progress events leaking into the next turn.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        qmd_future = executor.submit(copy_context().run, qmd_query, question, **kwargs)
+        wiki_future = executor.submit(copy_context().run, wiki_search, question, **kwargs)
+        qmd_report = qmd_future.result()
+        wiki_report = wiki_future.result()
     if any(not isinstance(report, str) or not report.strip()
            for report in (qmd_report, wiki_report)):
         raise ValueError("Both qmd_query and wiki_search must return non-empty reports")
@@ -88,7 +95,7 @@ def qmd_query(
             ]
             while turns < max_turns:
                 turns += 1
-                response = model.invoke(messages)
+                response = invoke_model(progress, "qmd_query", model, messages)
                 try:
                     value = json.loads(response.content)
                     validate(value)
@@ -327,7 +334,7 @@ def wiki_search(
         def search_agent(state: SearchState) -> dict:
             if state["model_turns"] >= max_turns:
                 raise RuntimeError(f"Search agent exceeded {max_turns} model turns")
-            response = model.invoke(state["messages"])
+            response = invoke_model(progress, "search", model, state["messages"])
             if not response.tool_calls:
                 content = response.content
                 known = set(sources.values())

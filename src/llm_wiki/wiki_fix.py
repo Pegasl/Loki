@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 
-from .progress import NullProgressReporter, ProgressReporter, report_event
+from .progress import NullProgressReporter, ProgressReporter, invoke_model, report_event
 
 
 def _fix_tools(document: Path, issues: list[dict], written_files: list[str]):
@@ -144,7 +144,7 @@ Your completion message does not establish that verification has passed."""),
         def fix_agent(state: FixState) -> dict:
             if state["model_turns"] >= 12:
                 raise RuntimeError("Fix agent exceeded 12 model turns")
-            response = model.invoke(state["messages"])
+            response = invoke_model(progress, "fix", model, state["messages"])
             return {"messages": [response], "model_turns": state["model_turns"] + 1}
 
         def route_fix(state: FixState) -> str:

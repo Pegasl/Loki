@@ -257,8 +257,14 @@ def main() -> None:
         try:
             result = graph.invoke(Command(resume=question), config)
         except KeyboardInterrupt:
+            report_event(reporter, "question_finished", "本轮已中断")
             print("\n已退出。")
             break
+        except BaseException:
+            report_event(reporter, "question_finished", "回答失败，已停止")
+            raise
+        finally:
+            report_event(reporter, "close")
     save_state(result)
     report(reporter.workflow_completed)
 
