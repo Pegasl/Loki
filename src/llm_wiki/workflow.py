@@ -1,8 +1,10 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Callable, TypedDict
 
+import yaml
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 from langgraph.types import RetryPolicy
@@ -100,7 +102,40 @@ def verify(
 def index(state: WikiState) -> dict[str, bool]:
     if not wiki_index():
         return {"index": False}
-    subprocess.run(["qmd", "embed"], cwd=root, check=True)
+    model_dir = Path.home() / ".cache" / "qmd" / "models"
+    models = {
+        "embed": str(model_dir / "Qwen3-Embedding-0.6B-Q8_0.gguf"),
+        "generate": str(model_dir / "qmd-query-expansion-1.7B-q4_k_m.gguf"),
+        "rerank": str(model_dir / "qwen3-reranker-0.6b-q8_0.gguf"),
+    }
+    # QMD resolves its project from PWD, which cwd alone does not update.
+    qmd_env = {
+        **os.environ,
+        "PWD": str(root),
+        **{f"QMD_{role.upper()}_MODEL": path for role, path in models.items()},
+    }
+    qmd = root / ".qmd"
+    config_path = qmd / "index.yaml"
+    if not config_path.is_file():
+        config_path = qmd / "index.yml"
+    if not config_path.is_file() or not (qmd / "index.sqlite").is_file():
+        subprocess.run(["qmd", "init"], cwd=root, env=qmd_env, check=True)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError(f"{config_path} must contain a YAML mapping")
+    collections = {
+        name: {"path": name, "pattern": "**/*.{md,txt}", "includeByDefault": True}
+        for name in ("raw", "wiki")
+    }
+    if config.get("collections") != collections or config.get("models") != models:
+        config["collections"] = collections
+        config["models"] = models
+        config_path.write_text(
+            yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+    subprocess.run(["qmd", "update"], cwd=root, env=qmd_env, check=True)
+    subprocess.run(["qmd", "embed"], cwd=root, env=qmd_env, check=True)
     return {"index": True}
 
 

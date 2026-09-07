@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 from llm_wiki import workflow
 
@@ -22,9 +22,23 @@ class WorkflowProgressTests(unittest.TestCase):
         self.sources = Path(self.temp_dir.name) / "sources.json"
         self.sources_patch = patch.object(workflow, "sources", self.sources)
         self.sources_patch.start()
+        self.root = Path(self.temp_dir.name)
+        self.root_patch = patch.object(workflow, "root", self.root)
+        self.root_patch.start()
+        self.qmd = self.root / ".qmd"
+        self.qmd.mkdir()
+        (self.qmd / "index.yml").write_text("collections: {}\n")
+        (self.qmd / "index.sqlite").touch()
+        model_dir = Path.home() / ".cache" / "qmd" / "models"
+        self.models = {
+            "embed": str(model_dir / "Qwen3-Embedding-0.6B-Q8_0.gguf"),
+            "generate": str(model_dir / "qmd-query-expansion-1.7B-q4_k_m.gguf"),
+            "rerank": str(model_dir / "qwen3-reranker-0.6b-q8_0.gguf"),
+        }
 
     def tearDown(self) -> None:
         self.sources_patch.stop()
+        self.root_patch.stop()
         self.temp_dir.cleanup()
 
     def write_sources(self, registrations: object) -> None:
@@ -167,7 +181,11 @@ class WorkflowProgressTests(unittest.TestCase):
             patch.object(workflow.subprocess, "run") as run,
         ):
             self.assertEqual(workflow.index(STATE), {"index": True})
-        run.assert_called_once_with(["qmd", "embed"], cwd=workflow.root, check=True)
+        self.assertEqual(run.call_args_list, [
+            call(["qmd", "update"], cwd=workflow.root, env=ANY, check=True),
+            call(["qmd", "embed"], cwd=workflow.root, env=ANY, check=True),
+        ])
+        self.assertEqual(run.call_args.kwargs["env"]["PWD"], str(self.root))
         for error in (FileNotFoundError("qmd"), subprocess.CalledProcessError(1, "qmd")):
             with (
                 self.subTest(error=error),
@@ -199,8 +217,79 @@ class WorkflowProgressTests(unittest.TestCase):
         self.assertTrue(result["index"])
         self.assertNotIn("embed", result)
         self.assertEqual(calls.mock_calls, [
-            call.index(), call.embed(["qmd", "embed"], cwd=workflow.root, check=True),
+            call.index(),
+            call.embed(["qmd", "update"], cwd=workflow.root, env=ANY, check=True),
+            call.embed(["qmd", "embed"], cwd=workflow.root, env=ANY, check=True),
         ])
+
+    def test_index_initializes_missing_local_config_or_database(self) -> None:
+        for missing in ("index.yml", "index.sqlite"):
+            with self.subTest(missing=missing):
+                (self.qmd / missing).unlink()
+
+                def run_command(command, **kwargs):
+                    for role, path in self.models.items():
+                        self.assertEqual(kwargs["env"][f"QMD_{role.upper()}_MODEL"], path)
+                    if command == ["qmd", "init"]:
+                        (self.qmd / "index.yml").write_text("collections: {}\n")
+                        (self.qmd / "index.sqlite").touch()
+
+                with (
+                    patch.object(workflow, "wiki_index", return_value=True),
+                    patch.object(workflow.subprocess, "run", side_effect=run_command) as run,
+                ):
+                    self.assertEqual(workflow.index(STATE), {"index": True})
+                self.assertEqual(run.call_args_list, [
+                    call(["qmd", command], cwd=self.root, env=ANY, check=True)
+                    for command in ("init", "update", "embed")
+                ])
+
+    def test_index_limits_collections_and_sets_cached_models_for_both_config_extensions(self) -> None:
+        for name in ("index.yml", "index.yaml"):
+            with self.subTest(name=name):
+                config_path = self.qmd / name
+                config_path.write_text(
+                    "models:\n  embed: custom.gguf\ncollections:\n  all:\n    path: .\n"
+                )
+                with (
+                    patch.object(workflow, "wiki_index", return_value=True),
+                    patch.object(workflow.subprocess, "run"),
+                ):
+                    self.assertEqual(workflow.index(STATE), {"index": True})
+                config = workflow.yaml.safe_load(config_path.read_text())
+                self.assertEqual(config["models"], self.models)
+                self.assertEqual(config["collections"], {
+                    directory: {
+                        "path": directory, "pattern": "**/*.{md,txt}",
+                        "includeByDefault": True,
+                    }
+                    for directory in ("raw", "wiki")
+                })
+
+    def test_index_replaces_models_even_when_collections_already_match(self) -> None:
+        with (
+            patch.object(workflow, "wiki_index", return_value=True),
+            patch.object(workflow.subprocess, "run"),
+        ):
+            workflow.index(STATE)
+            config_path = self.qmd / "index.yml"
+            config = workflow.yaml.safe_load(config_path.read_text())
+            config["models"] = {"embed": "old-model.gguf"}
+            config_path.write_text(workflow.yaml.safe_dump(config))
+            workflow.index(STATE)
+        self.assertEqual(
+            workflow.yaml.safe_load(config_path.read_text())["models"], self.models
+        )
+
+    def test_qmd_update_failure_prevents_embed(self) -> None:
+        with (
+            patch.object(workflow, "wiki_index", return_value=True),
+            patch.object(workflow.subprocess, "run", side_effect=
+                         subprocess.CalledProcessError(1, ["qmd", "update"])) as run,
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                workflow.index(STATE)
+        run.assert_called_once_with(["qmd", "update"], cwd=self.root, env=ANY, check=True)
 
     def test_native_retries_stop_and_verify_is_attempted_only_once(self) -> None:
         real_policy = workflow.RetryPolicy
