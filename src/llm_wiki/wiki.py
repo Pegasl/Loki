@@ -498,6 +498,41 @@ def _append_verify_log(root: Path, results: list[dict], phase: str = "verify") -
     return True
 
 
+def _mark_verified_sources_ingested(root: Path, results: list[dict]) -> bool:
+    passed = {
+        tuple(result["registration"][field] for field in ("filename", "srcid", "sha256"))
+        for result in results if not result["errors"] and "registration" in result
+    }
+    if not passed:
+        return True
+    try:
+        sources_file = root / "wiki" / "sources.json"
+        registrations = json.loads(sources_file.read_text(encoding="utf-8"))
+        if not isinstance(registrations, list):
+            return False
+        changed = False
+        for registration in registrations:
+            if not isinstance(registration, dict):
+                continue
+            identity = tuple(registration.get(field) for field in ("filename", "srcid", "sha256"))
+            if all(isinstance(value, str) for value in identity) and identity in passed:
+                if registration.get("ingest") is not True:
+                    registration["ingest"] = True
+                    changed = True
+        if changed:
+            sources_file.write_text(
+                json.dumps(registrations, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+    except (OSError, UnicodeError, ValueError) as error:
+        _append_verify_log(root, [{
+            "filename": "sources.json", "srcid": "unknown",
+            "errors": [{"message": f"unable to update ingest status: {error}"}],
+        }])
+        return False
+    return True
+
+
 def wiki_verify(
     root: str | Path = ".", *, fix: bool = False,
     reporter: ProgressReporter | None = None,
@@ -506,6 +541,8 @@ def wiki_verify(
     root = Path(root).expanduser().resolve()
     results = _verify_sources(root)
     if not _append_verify_log(root, results):
+        return False
+    if not _mark_verified_sources_ingested(root, results):
         return False
     if not any(result["errors"] for result in results):
         return True
@@ -536,7 +573,8 @@ def wiki_verify(
     # The checker decides success, including after a partially completed agent run.
     results = _verify_sources(root)
     logs_ok = _append_verify_log(root, results, phase="recheck") and logs_ok
-    return logs_ok and not any(result["errors"] for result in results)
+    statuses_ok = _mark_verified_sources_ingested(root, results)
+    return logs_ok and statuses_ok and not any(result["errors"] for result in results)
 
 
 def wiki_index(root: str | Path = ".") -> bool:
