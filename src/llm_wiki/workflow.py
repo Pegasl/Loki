@@ -7,7 +7,10 @@ from typing import Callable, TypedDict
 import yaml
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
-from langgraph.types import RetryPolicy
+from langgraph.types import Command, RetryPolicy, interrupt
+from langgraph.checkpoint.memory import InMemorySaver
+
+from .wiki_agent import agent_nodes
 
 from .progress import (
     NullProgressReporter,
@@ -22,12 +25,18 @@ class NodeFailedError(RuntimeError):
     """A workflow node returned an unsuccessful result."""
 
 
-class WikiState(TypedDict):
+class WikiState(TypedDict, total=False):
     init: bool
     ingest: bool
     verify: bool
     index: bool
-    retrieve: bool
+    question: str
+    messages: list
+    history: list
+    model_turns: int
+    retrieval_attempted: bool
+    retrieval_succeeded: bool
+    next: str
 
 
 root = Path(".").expanduser().resolve()
@@ -41,7 +50,8 @@ state_file = wiki / "state.json"
 
 def save_state(state: WikiState) -> None:
     with open(state_file, "w", encoding="utf-8") as file:
-        json.dump(state, file, ensure_ascii=False, indent=2)
+        json.dump({stage: state.get(stage, False) for stage in ("init", "ingest", "verify", "index")},
+                  file, ensure_ascii=False, indent=2)
 
 
 def init(state: WikiState) -> dict[str, bool]:
@@ -139,22 +149,19 @@ def index(state: WikiState) -> dict[str, bool]:
     return {"index": True}
 
 
-def retrieve(state: WikiState) -> dict[str, bool]:
-    # if
-    #     return {"retrieve": True}
-    # else:
-    #     return {"retrieve": False}
-    return {"retrieve": True}
+def ask(state: WikiState) -> dict:
+    question = interrupt("请输入问题（退出 / exit / quit 结束）：")
+    question = question.strip()
+    if question.lower() in {"退出", "exit", "quit"}:
+        return {"next": END}
+    if not question:
+        return {"next": "ask"}
+    return {"question": question, "messages": [], "model_turns": 0,
+            "retrieval_attempted": False, "retrieval_succeeded": False, "next": "agent"}
 
 
-# def llm_call(state: WikiState) -> WikiState:
-#     new_state = state.copy()
-#     new_state["retrieve"] = True
-#     save_state(new_state)
-#     return new_state
-
-
-def build_graph(reporter: ProgressReporter | None = None):
+def build_graph(reporter: ProgressReporter | None = None, *, checkpointer=None,
+                output=print, max_turns: int = 30):
     progress = reporter or NullProgressReporter()
     retry_policy = RetryPolicy(max_attempts=6, retry_on=NodeFailedError)
 
@@ -192,15 +199,20 @@ def build_graph(reporter: ProgressReporter | None = None):
     builder.add_node("verify", wrap_stage("verify", run_verify),
                      retry_policy=RetryPolicy(max_attempts=1))
     builder.add_node("index", wrap_stage("index", index), retry_policy=retry_policy)
-    builder.add_node("retrieve", wrap_stage("retrieve", retrieve), retry_policy=retry_policy)
+    agent, tools = agent_nodes(root, progress, output, max_turns=max_turns)
+    builder.add_node("ask", ask)
+    builder.add_node("agent", agent)
+    builder.add_node("tools", tools)
 
     builder.add_edge(START, "init")
     builder.add_edge("init", "ingest")
     builder.add_edge("ingest", "verify")
     builder.add_edge("verify", "index")
-    builder.add_edge("index", "retrieve")
-    builder.add_edge("retrieve", END)
-    return builder.compile()
+    builder.add_edge("index", "ask")
+    builder.add_conditional_edges("ask", lambda state: state["next"], ["ask", "agent", END])
+    builder.add_conditional_edges("agent", lambda state: state["next"], ["ask", "agent", "tools"])
+    builder.add_edge("tools", "agent")
+    return builder.compile(checkpointer=checkpointer)
 
 
 wiki_graph = build_graph()
@@ -216,14 +228,26 @@ def main() -> None:
             "ingest": False,
             "verify": False,
             "index": False,
-            "retrieve": False,
         }
         wiki.mkdir(exist_ok=True)
         state_file.write_text(json.dumps(initial_state), encoding="utf-8")
 
     reporter = TerminalProgressReporter()
     report(reporter.workflow_started)
-    result = build_graph(reporter).invoke(initial_state)
+    graph = build_graph(reporter, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "wiki-cli"}, "recursion_limit": 100}
+    result = graph.invoke(initial_state, config)
+    while result.get("__interrupt__"):
+        try:
+            question = input(result["__interrupt__"][0].value)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            question = "exit"
+        try:
+            result = graph.invoke(Command(resume=question), config)
+        except KeyboardInterrupt:
+            print("\n已退出。")
+            break
     save_state(result)
     report(reporter.workflow_completed)
 

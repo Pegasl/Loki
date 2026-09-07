@@ -12,12 +12,15 @@ from llm_wiki import workflow
 
 STATE = {
     "init": False, "ingest": False, "verify": False,
-    "index": False, "retrieve": False,
+    "index": False,
 }
 
 
 class WorkflowProgressTests(unittest.TestCase):
     def setUp(self) -> None:
+        ask_patch = patch.object(workflow, "ask", side_effect=lambda state: {"next": workflow.END})
+        ask_patch.start()
+        self.addCleanup(ask_patch.stop)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.sources = Path(self.temp_dir.name) / "sources.json"
         self.sources_patch = patch.object(workflow, "sources", self.sources)
@@ -167,7 +170,7 @@ class WorkflowProgressTests(unittest.TestCase):
                 result = workflow.build_graph(reporter).invoke({
                     stage: stage in completed for stage in STATE
                 })
-                self.assertTrue(all(result.values()))
+                self.assertTrue(all(result[stage] for stage in STATE))
                 for stage, node in nodes.items():
                     self.assertEqual(node.call_count, int(stage not in completed))
                 self.assertEqual(reporter.stage_started.call_args_list, [
@@ -343,7 +346,7 @@ class WorkflowProgressTests(unittest.TestCase):
                 for stage in STATE
             }
             result = workflow.build_graph().invoke(STATE)
-        self.assertTrue(all(result.values()))
+        self.assertTrue(all(result[stage] for stage in STATE))
         for stage, node in nodes.items():
             self.assertEqual(node.call_count, 1 if stage == "verify" else 6)
 
@@ -363,7 +366,7 @@ class WorkflowProgressTests(unittest.TestCase):
             result = workflow.build_graph(reporter).invoke(STATE)
 
         self.assertEqual(
-            result,
+            {stage: result[stage] for stage in STATE},
             {stage: True for stage in STATE},
         )
         self.assertEqual(
@@ -373,7 +376,6 @@ class WorkflowProgressTests(unittest.TestCase):
                 call("ingest", 1),
                 call("verify", 1),
                 call("index", 1),
-                call("retrieve", 1),
             ],
         )
         self.assertEqual(
@@ -405,28 +407,17 @@ class WorkflowProgressTests(unittest.TestCase):
         reporter.stage_failed.assert_called_once_with("init")
         reporter.stage_retrying.assert_called_once_with("init", 2)
 
-    def test_graph_retries_retrieve_before_completing(self) -> None:
-        reporter = Mock(spec=workflow.ProgressReporter)
-        state_path = Path(self.temp_dir.name) / "state.json"
-        self.write_sources([])
+    def test_completed_old_state_still_enters_ask(self):
+        with patch.object(workflow, "ask", return_value={"next": workflow.END}) as ask:
+            result = workflow.build_graph().invoke({**{stage: True for stage in STATE}, "retrieve": True})
+        ask.assert_called_once()
+        self.assertNotIn("retrieve", result)
 
-        with (
-            patch.object(workflow, "state_file", state_path),
-            patch.object(workflow, "wiki_init", return_value=True),
-            patch.object(workflow, "wiki_register", return_value=True),
-            patch.object(workflow, "wiki_verify", return_value=True),
-            patch.object(workflow, "wiki_index", return_value=True),
-            patch.object(workflow.subprocess, "run"),
-            patch.object(workflow, "retrieve", side_effect=[{"retrieve": False}, {"retrieve": True}]),
-        ):
-            result = workflow.build_graph(reporter).invoke(STATE)
-
-        self.assertTrue(result["retrieve"])
-        self.assertEqual(
-            [item for item in reporter.stage_started.call_args_list if item.args[0] == "retrieve"],
-            [call("retrieve", 1), call("retrieve", 2)],
-        )
-        reporter.stage_retrying.assert_called_once_with("retrieve", 2)
+    def test_save_state_excludes_conversation(self):
+        state_path = self.root / "state.json"
+        with patch.object(workflow, "state_file", state_path):
+            workflow.save_state({**STATE, "messages": [object()], "retrieve": True})
+        self.assertEqual(json.loads(state_path.read_text()), STATE)
 
 
 if __name__ == "__main__":
