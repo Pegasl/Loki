@@ -404,15 +404,45 @@ class WikiVerifyTests(unittest.TestCase):
         self.assertIn("recheck | topic.txt", log)
         self.assertIn("recheck | second.txt", log)
 
+    def test_fix_corrects_tool_error_and_rechecks(self) -> None:
+        _, _, page, original = self.prepare_repair()
+        model, _ = self.mock_model([
+            self.write_response("concepts/unreported.md", "invalid target"),
+            self.write_response("concepts/topic.md", original),
+            AIMessage(content="done"),
+        ])
+        reporter = Mock(spec=ProgressReporter)
+        self.assertTrue(wiki_verify(self.root, fix=True, reporter=reporter))
+        feedback = model.invoke.call_args_list[1].args[0][-1]
+        self.assertEqual(feedback.status, "error")
+        self.assertEqual(feedback.tool_call_id, "fix-write")
+        self.assertIn("Only reported files", feedback.content)
+        self.assertEqual(page.read_text(), original)
+        reporter.tool_failed.assert_called_once()
+        reporter.agent_failed.assert_not_called()
+
     def test_fix_model_turns_are_bounded(self) -> None:
         self.prepare_repair()
         response = AIMessage(content="", tool_calls=[{
             "name": "list_files", "args": {}, "id": "list", "type": "tool_call",
         }])
-        model, _ = self.mock_model([response] * 12)
+        model, _ = self.mock_model([response.model_copy(deep=True) for _ in range(12)])
         self.assertFalse(wiki_verify(self.root, fix=True))
         self.assertEqual(model.invoke.call_count, 12)
         self.assertIn("exceeded 12 model turns", self.log.read_text())
+
+    def test_fix_can_finish_on_twelfth_model_turn(self) -> None:
+        _, _, page, original = self.prepare_repair()
+        responses = [AIMessage(content="", tool_calls=[{
+            "name": "list_files", "args": {}, "id": f"list-{turn}", "type": "tool_call",
+        }]) for turn in range(10)]
+        model, _ = self.mock_model([
+            *responses, self.write_response("concepts/topic.md", original),
+            AIMessage(content="done"),
+        ])
+        self.assertTrue(wiki_verify(self.root, fix=True))
+        self.assertEqual(model.invoke.call_count, 12)
+        self.assertEqual(page.read_text(), original)
 
     def test_fix_tools_reject_unrelated_files_and_path_escape(self) -> None:
         _, document, _, _ = self.prepare_repair()

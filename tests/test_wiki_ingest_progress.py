@@ -3,9 +3,9 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 from llm_wiki.progress import NullProgressReporter, TerminalProgressReporter
 from llm_wiki.wiki import wiki_ingest
@@ -119,10 +119,11 @@ class UnknownToolChatModel(FakeChatModel):
                                 "type": "tool_call",
                             }
                         ],
-                    )
+                    ),
+                    AIMessage(content="recovered"),
                 ]
             )
-        return FakeBoundModel([])
+        return FakeBoundModel([AIMessage(content="done")])
 
 
 class LegacyReporter:
@@ -241,14 +242,50 @@ class WikiIngestProgressTests(unittest.TestCase):
         with patch("langchain_openai.ChatOpenAI", UnknownToolChatModel):
             result = wiki_ingest("srcid-test", reporter=reporter)
 
-        self.assertFalse(result)
+        self.assertTrue(result)
         self.assertEqual(
-            reporter.events[-2:],
+            [event for event in reporter.events if event[0] == "tool"],
             [
                 ("tool", "unknown_tool", "unknown-call", "START"),
                 ("tool", "unknown_tool", "unknown-call", "FAILED"),
             ],
         )
+
+    def test_both_ingest_agents_correct_tool_errors(self) -> None:
+        def call(name, args, call_id):
+            return AIMessage(content="", tool_calls=[
+                {"name": name, "args": args, "id": call_id, "type": "tool_call"}
+            ])
+
+        alias = Mock()
+        alias.invoke.side_effect = [
+            call("write_aliases", {"content": "invalid json"}, "bad-json"),
+            call("write_aliases", {"content": '{"version": 1, "entries": []}'}, "fixed-json"),
+            AIMessage(content="done"),
+        ]
+        content = Mock()
+        content.invoke.side_effect = [
+            call("list_files", {"path": "source"}, "bad-path"),
+            call("list_files", {"path": "."}, "fixed-path"),
+            call("write_file", {"path": "concepts/recovered.md", "content": "recovered"}, "write"),
+            AIMessage(content="done"),
+        ]
+        model = Mock()
+        model.bind_tools.side_effect = [alias, content]
+        reporter = RecordingReporter()
+        with patch("langchain_openai.ChatOpenAI", return_value=model):
+            self.assertTrue(wiki_ingest("srcid-test", reporter=reporter))
+        for bound, call_id in ((alias, "bad-json"), (content, "bad-path")):
+            feedback = bound.invoke.call_args_list[1].args[0][-1]
+            self.assertIsInstance(feedback, ToolMessage)
+            self.assertEqual(feedback.status, "error")
+            self.assertEqual(feedback.tool_call_id, call_id)
+            self.assertEqual(bound.invoke.call_args_list[2].args[0][-1].status, "success")
+        self.assertEqual(
+            (self.root / "wiki/source/concepts/recovered.md").read_text(), "recovered\n"
+        )
+        self.assertIn(("tool", "write_aliases", "bad-json", "FAILED"), reporter.events)
+        self.assertIn(("tool", "list_files", "bad-path", "FAILED"), reporter.events)
 
     def test_legacy_reporter_without_inner_methods_remains_compatible(self) -> None:
         with patch("langchain_openai.ChatOpenAI", FakeChatModel):

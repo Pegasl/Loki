@@ -33,7 +33,7 @@ def _fix_tools(document: Path, issues: list[dict], written_files: list[str]):
 
     @tool
     def list_files(path: str = ".") -> str:
-        """List files and directories inside this source's Wiki directory."""
+        """List a document-relative directory; use "." for this source's Wiki root."""
         target = document_path(path)
         return "\n".join(
             item.relative_to(document).as_posix() + ("/" if item.is_dir() else "")
@@ -83,8 +83,10 @@ def fix_source(
     progress = reporter or NullProgressReporter()
     report_event(progress, "agent_started", "fix")
     try:
-        from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+        from langchain_core.messages import HumanMessage, SystemMessage
         from langchain_openai import ChatOpenAI
+        from langgraph.graph import END, START, MessagesState, StateGraph
+        from .tool_execution import wiki_tool_node
 
         if not result["errors"] or not all(item["repairable"] for item in result["errors"]):
             raise ValueError("Source has no eligible repair batch")
@@ -106,7 +108,6 @@ def fix_source(
             "source": os.path.relpath(root / "raw" / registration["filename"], summary.parent).replace(os.sep, "/"),
         }
         available_tools = _fix_tools(document, result["errors"], written_files)
-        tool_map = {item.name: item for item in available_tools}
         model = ChatOpenAI(
             model=os.environ["MODEL_NAME"], api_key=os.environ["OPENAI_API_KEY"],
             base_url=os.environ["OPENAI_BASE_URL"], max_retries=0,
@@ -126,6 +127,8 @@ reliable item exists in the source, create concepts/placeholder.md (type Concept
 or entities/placeholder.md (type Entity) explaining that none was identified;
 do not invent content. Tools only allow editing reported files and creating pages
 in missing categories. Finish with a brief report after the necessary writes.
+All tool paths are relative to this document directory; use list_files(".") for its root.
+If a tool returns an error, correct the call before proceeding; failed writes are not complete.
 Your completion message does not establish that verification has passed."""),
             HumanMessage(content=json.dumps({
                 "registration": registration,
@@ -135,25 +138,30 @@ Your completion message does not establish that verification has passed."""),
                 "original_source": source_bytes.decode("utf-8"),
             }, ensure_ascii=False)),
         ]
-        for _ in range(12):
-            response = model.invoke(messages)
-            messages.append(response)
-            if not response.tool_calls:
-                report_event(progress, "agent_succeeded", "fix")
-                return
-            for call in response.tool_calls:
-                name, call_id = call["name"], call["id"]
-                report_event(progress, "tool_started", name, call_id)
-                try:
-                    if name not in tool_map:
-                        raise ValueError(f"Unknown repair tool: {name}")
-                    output = tool_map[name].invoke(call["args"])
-                except Exception as error:
-                    report_event(progress, "tool_failed", name, call_id, error)
-                    raise
-                report_event(progress, "tool_succeeded", name, call_id)
-                messages.append(ToolMessage(content=str(output), tool_call_id=call_id))
-        raise RuntimeError("Fix agent exceeded 12 model turns")
+        class FixState(MessagesState):
+            model_turns: int
+
+        def fix_agent(state: FixState) -> dict:
+            if state["model_turns"] >= 12:
+                raise RuntimeError("Fix agent exceeded 12 model turns")
+            response = model.invoke(state["messages"])
+            return {"messages": [response], "model_turns": state["model_turns"] + 1}
+
+        def route_fix(state: FixState) -> str:
+            return "tools" if state["messages"][-1].tool_calls else END
+
+        builder = StateGraph(FixState)
+        builder.add_node("fix_agent", fix_agent)
+        builder.add_node("tools", wiki_tool_node(available_tools, progress))
+        builder.add_edge(START, "fix_agent")
+        builder.add_conditional_edges("fix_agent", route_fix, {"tools": "tools", END: END})
+        builder.add_edge("tools", "fix_agent")
+        builder.compile().invoke(
+            {"messages": messages, "model_turns": 0},
+            # Leave room for the explicit model-turn guard after 12 tool batches.
+            config={"recursion_limit": 30},
+        )
+        report_event(progress, "agent_succeeded", "fix")
     except Exception as error:
         report_event(progress, "agent_failed", "fix", error)
         raise
