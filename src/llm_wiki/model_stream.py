@@ -1,8 +1,33 @@
 """Route public progress and Markdown answers from model responses."""
 
-from langchain_core.messages import message_chunk_to_message
+from langchain_core.messages import SystemMessage, message_chunk_to_message
 
 from .progress import report_event
+
+
+PROGRESS_INSTRUCTIONS = """Before a meaningful group of tool calls, give a brief public progress update in
+the user's language, as <progress>Your short update here</progress>, then call
+the tools in the same response. Explain the next action or a supported finding;
+do not disclose internal reasoning, invent findings, or narrate every file read.
+Use Chinese if the user's language is unavailable in this internal task.
+On tool-call turns, put all public text inside the leading progress block.
+If this task plans searches or other operations using JSON instead of native tool
+calls, put the same brief progress block before the JSON payload when useful.
+The leading progress block is an out-of-band UI update: the application removes
+it before parsing your result. All JSON-only or other output-format requirements
+apply to the remaining payload, which must retain its required format exactly.
+Do not add progress tags inside JSON strings or the final user-facing answer.
+"""
+
+
+def with_progress_instructions(messages):
+    result = list(messages)
+    for index, message in enumerate(result):
+        if isinstance(message, SystemMessage):
+            result[index] = message.model_copy(update={
+                "content": text_content(message.content) + "\n\n" + PROGRESS_INSTRUCTIONS})
+            return result
+    return [SystemMessage(content=PROGRESS_INSTRUCTIONS), *result]
 
 
 def text_content(content):
@@ -80,11 +105,17 @@ class ResponseText:
 
 
 def invoke(reporter, agent, model, messages):
+    messages = with_progress_instructions(messages)
     report_event(reporter, "model_started", agent)
-    stream = agent == "ask" and getattr(reporter, "stream_models", False) is True
-    project_answer = stream and callable(getattr(reporter, "answer_delta", None))
+    stream = getattr(reporter, "stream_models", False) is True
+    project_answer = agent == "ask" and stream and callable(getattr(reporter, "answer_delta", None))
+    def commentary(text):
+        if callable(getattr(reporter, "agent_commentary_delta", None)):
+            report_event(reporter, "agent_commentary_delta", agent, text)
+        else:
+            report_event(reporter, "commentary_delta", text)
     public = ResponseText(
-        lambda text: report_event(reporter, "commentary_delta", text),
+        commentary,
         lambda text: report_event(reporter, "answer_delta", text) if project_answer else None,
         lambda: report_event(reporter, "commentary_finished"),
     )
@@ -92,8 +123,7 @@ def invoke(reporter, agent, model, messages):
         if not stream or not callable(getattr(model, "stream", None)):
             project_answer = False
             response = model.invoke(messages)
-            if agent == "ask":
-                public.feed(text_content(response.content))
+            public.feed(text_content(response.content))
         else:
             combined = None
             iterator = model.stream(messages)
@@ -108,11 +138,10 @@ def invoke(reporter, agent, model, messages):
             if combined is None:
                 raise ValueError("Model returned an empty stream")
             response = message_chunk_to_message(combined)
-        if agent == "ask":
-            public.finish()
-            response.content = public.text
-            if project_answer and public.text:
-                response.additional_kwargs["loki_streamed_answer"] = public.text
+        public.finish()
+        response.content = public.text
+        if project_answer and public.text:
+            response.additional_kwargs["loki_streamed_answer"] = public.text
         report_event(reporter, "model_finished", agent)
         return response
     except BaseException:

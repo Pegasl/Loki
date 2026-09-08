@@ -24,6 +24,7 @@ class ActivityLog:
         self.stop = threading.Event()
         self.visible = False
         self.text_open = False
+        self.text_owner = None
 
     def _clear(self):
         if self.visible:
@@ -90,14 +91,19 @@ class ActivityLog:
             print(clean(message, multiline=True), flush=True)
             self.refresh()
 
-    def text(self, fragment):
+    def text(self, fragment, *, owner=None):
         with self.lock:
             self._clear()
             fragment = clean(fragment, multiline=True)
             if fragment:
+                if self.text_open and self.text_owner != owner:
+                    self.end_text()
+                if owner is not None and not self.text_open:
+                    sys.stdout.write(f"[{clean(owner)}] ")
                 sys.stdout.write(fragment)
                 sys.stdout.flush()
                 self.text_open = True
+                self.text_owner = owner
 
     def end_text(self):
         with self.lock:
@@ -105,6 +111,7 @@ class ActivityLog:
                 sys.stdout.write("\n")
                 sys.stdout.flush()
                 self.text_open = False
+                self.text_owner = None
 
     def close(self):
         self.stop.set()

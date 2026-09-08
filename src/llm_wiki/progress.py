@@ -287,6 +287,9 @@ class TerminalProgressReporter(NullProgressReporter):
     def commentary_delta(self, text):
         self.log.text(text)
 
+    def agent_commentary_delta(self, agent, text):
+        self.log.text(text, owner=None if agent == "ask" else self.AGENTS.get(agent, agent))
+
     def answer_delta(self, text):
         self.log.text(text)
 

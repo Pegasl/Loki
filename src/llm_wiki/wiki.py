@@ -157,14 +157,11 @@ def wiki_register(root: str | Path = ".") -> bool:
                 continue
 
             srcid = "srcid-" + secrets.token_hex(3)
-            while srcid in used_srcids:
+            while srcid in used_srcids or (wiki / srcid).exists():
                 srcid = "srcid-" + secrets.token_hex(3)
             used_srcids.add(srcid)
 
-            document_name = file.stem.strip() or "source"
-            document = wiki / document_name
-            if document.exists():
-                document = wiki / f"{document_name}-{srcid}"
+            document = wiki / srcid
 
             document.mkdir(parents=True, exist_ok=False)
             (document / "concepts").mkdir()
@@ -289,9 +286,15 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, object], str]:
 def _wiki_document(
     wiki: Path, filename: str, srcid: str
 ) -> tuple[Path | None, Path, str | None]:
-    """Locate a registered document using wiki_register's naming rules."""
-    document_name = Path(filename).stem.strip() or "source"
+    """Resolve SrcID folders, with read compatibility for older title folders."""
+    if (not isinstance(srcid, str) or not srcid.startswith("srcid-")
+            or srcid in {".", ".."} or "/" in srcid or "\\" in srcid):
+        return None, wiki, "invalid SrcID directory name"
     summary_name = f"source-summary-{srcid.removeprefix('srcid-')}.md"
+    document = wiki / srcid
+    if document.is_dir():
+        return document, document / summary_name, None
+    document_name = Path(filename).stem.strip() or "source"
     candidates = list(dict.fromkeys([
         wiki / document_name,
         wiki / f"{document_name}-{srcid}",
