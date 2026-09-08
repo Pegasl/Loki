@@ -146,8 +146,7 @@ def qmd_query(
                             or ".." in relative.parts or relative.is_absolute()):
                         raise ValueError("Unexpected QMD source path")
                     # Indexes guide navigation, but do not substantiate an answer.
-                    if (relative.name == "index.md" or relative.parts[:2] == ("wiki", "query")
-                            or not hit["snippet"].strip()):
+                    if relative.name == "index.md" or not hit["snippet"].strip():
                         continue
                     if path not in evidence:
                         evidence[path] = {"citation": f"S{len(evidence) + 1}",
@@ -225,8 +224,6 @@ def _search_tools(wiki: Path, sources: dict[str, str]):
         relative = Path(path)
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("Use a wiki-relative path without '..'")
-        if relative.parts and relative.parts[0] == "query":
-            raise ValueError("Archived Q&A is not primary Wiki evidence")
         target = wiki / relative
         if not target.resolve().is_relative_to(wiki):
             raise ValueError("Path escapes wiki")
@@ -257,7 +254,7 @@ def _search_tools(wiki: Path, sources: dict[str, str]):
         return "\n".join(
             item.relative_to(wiki).as_posix() + ("/" if item.is_dir() else "")
             for item in sorted(target.iterdir())
-            if not item.is_symlink() and item != wiki / "query"
+            if not item.is_symlink()
         ) or "(empty directory)"
 
     @tool
