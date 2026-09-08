@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import readline
 from pathlib import Path
 from typing import Callable, TypedDict
 
@@ -35,8 +36,6 @@ class WikiState(TypedDict, total=False):
     messages: list
     history: list
     model_turns: int
-    retrieval_attempted: bool
-    retrieval_succeeded: bool
     next: str
 
 
@@ -162,7 +161,7 @@ def ask(state: WikiState) -> dict:
     if not question:
         return {"next": "ask"}
     return {"question": question, "messages": [], "model_turns": 0,
-            "retrieval_attempted": False, "retrieval_succeeded": False, "next": "agent"}
+            "next": "agent"}
 
 
 def build_graph(reporter: ProgressReporter | None = None, *, checkpointer=None,

@@ -9,7 +9,7 @@ import unicodedata
 
 
 def clean(text, *, multiline=False):
-    return "".join(c for c in str(text) if c.isprintable() or (multiline and c == "\n"))
+    return "".join(c for c in str(text) if c.isprintable() or (multiline and c in "\n\t"))
 
 
 class ActivityLog:

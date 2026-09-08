@@ -287,6 +287,12 @@ class TerminalProgressReporter(NullProgressReporter):
     def commentary_delta(self, text):
         self.log.text(text)
 
+    def answer_delta(self, text):
+        self.log.text(text)
+
+    def answer_incomplete(self):
+        self.log.line("回答未完成。")
+
     def commentary_finished(self):
         self.log.end_text()
         self.log.refresh()
