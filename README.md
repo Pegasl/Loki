@@ -150,8 +150,6 @@ PYTHONPATH=src python -m llm_wiki.workflow
 └── .qmd/                    # 本地检索配置与索引
 ```
 
-`raw/`、`wiki/`、`.qmd/` 和 `.env` 属于本地数据，不包含在当前已跟踪的源码中。本地的 `tests/`、`docs/` 和 `evals/` 也被忽略，不应假定克隆仓库后会存在。
-
 ## 常见问题
 
 | 现象 | 处理方式 |
